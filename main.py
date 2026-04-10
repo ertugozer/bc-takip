@@ -335,6 +335,31 @@ def run_report(trigger: str = "cron") -> str:
 #  FLASK ENDPOINT'LERİ
 # ══════════════════════════════════════════════════════════════════════════
 
+@app.route("/debug")
+def debug():
+    """Tüm atanmış görevleri ve bucket isimlerini gösterir."""
+    try:
+        token = get_access_token()
+    except Exception as e:
+        return f"<pre>Token hatası: {e}</pre>", 500
+
+    lines = []
+    for acct_id in BASECAMP_ACCOUNT_IDS:
+        try:
+            todos = bc_get(token, acct_id, "my/assignments.json")
+            lines.append(f"\n=== Hesap {acct_id} ({len(todos)} görev) ===")
+            for t in todos:
+                bucket_name = (t.get("bucket") or {}).get("name", "YOK")
+                bucket_name_lower = bucket_name.lower().strip()
+                match = "✅ EŞLEŞİYOR" if bucket_name_lower in TARGET_PROJECTS else "❌"
+                lines.append(f"{match}  [{repr(bucket_name_lower)}]  {t.get('title','')}")
+        except Exception as e:
+            lines.append(f"Hesap {acct_id} hata: {e}")
+
+    lines.append(f"\nHEDEF PROJELER: {list(TARGET_PROJECTS.keys())}")
+    return f"<pre>{chr(10).join(lines)}</pre>", 200
+
+
 @app.route("/health")
 def health():
     return jsonify({"status": "ok", "time": datetime.now().isoformat()})
