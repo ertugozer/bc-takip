@@ -216,7 +216,10 @@ def send_email(subject: str, body: str) -> None:
     msg["From"]    = GMAIL_USER
     msg["To"]      = RECIPIENT_EMAIL
     msg["Subject"] = subject
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=30) as server:
+    # Port 587 (STARTTLS) — Railway 465'i engelliyor
+    with smtplib.SMTP("smtp.gmail.com", 587, timeout=30) as server:
+        server.ehlo()
+        server.starttls()
         server.login(GMAIL_USER, GMAIL_PASSWORD)
         server.sendmail(GMAIL_USER, RECIPIENT_EMAIL, msg.as_string())
 
@@ -290,7 +293,7 @@ def run_report(trigger: str = "cron") -> str:
             status, commenter = determine_status(todo, last_comment)
 
             categorized[status].append({
-                "name":      todo.get("title", ""),
+                "name":      todo.get("title") or todo.get("content") or todo.get("summary") or "",
                 "brand":     brand,
                 "commenter": commenter,
             })
@@ -316,7 +319,7 @@ def run_report(trigger: str = "cron") -> str:
         excel_names = {t["name"].lower().strip() for t in excel_tasks}
         ekle_listesi = []
         for todo in todos:
-            name = todo.get("title", "").strip()
+            name = todo.get("title") or todo.get("content") or todo.get("summary") or "".strip()
             if name.lower() not in excel_names:
                 project_raw = (todo.get("bucket") or {}).get("name", "")
                 brand       = TARGET_PROJECTS.get(project_raw.lower().strip(), project_raw)
@@ -326,10 +329,14 @@ def run_report(trigger: str = "cron") -> str:
         report = build_report(categorized, sil_listesi, ekle_listesi, today, excel_error)
         print(f"\n{'═'*50}\n{report}\n{'═'*50}")
 
-        # 7. Mail gönder
+        # 7. Mail gönder (hata olursa raporu bozmaz)
         if GMAIL_USER and GMAIL_PASSWORD:
-            send_email(f"📋 Excel Güncelleme Talimatları — {today}", report)
-            print("✉️  Mail gönderildi!")
+            try:
+                send_email(f"📋 Excel Güncelleme Talimatları — {today}", report)
+                print("✉️  Mail gönderildi!")
+            except Exception as mail_err:
+                print(f"⚠️  Mail gönderilemedi: {mail_err}")
+                report += f"\n\n⚠️ Mail gönderilemedi: {mail_err}"
         else:
             print("ℹ️  Mail bilgileri eksik, atlandı.")
 
@@ -367,7 +374,9 @@ def debug():
                 bucket_name = (t.get("bucket") or {}).get("name", "YOK")
                 bucket_lower = bucket_name.lower().strip()
                 match = "✅" if bucket_lower in TARGET_PROJECTS else "❌"
-                lines.append(f"{match} [{repr(bucket_lower)}] {t.get('title','')}")
+                # title yoksa content, summary, name dene
+                title = t.get("title") or t.get("content") or t.get("summary") or t.get("name") or "???"
+                lines.append(f"{match} [{repr(bucket_lower)}] {title}")
         except Exception as e:
             lines.append(f"Hesap {acct_id} hata: {e}")
 
