@@ -349,10 +349,10 @@ def debug():
             todos = bc_get(token, acct_id, "my/assignments.json")
             lines.append(f"\n=== Hesap {acct_id} ({len(todos)} görev) ===")
             for t in todos:
-                bucket_name = (t.get("bucket") or {}).get("name", "YOK")
-                bucket_name_lower = bucket_name.lower().strip()
-                match = "✅ EŞLEŞİYOR" if bucket_name_lower in TARGET_PROJECTS else "❌"
-                lines.append(f"{match}  [{repr(bucket_name_lower)}]  {t.get('title','')}")
+                lines.append(f"\n--- Görev: {t.get('title','')} ---")
+                lines.append(f"bucket: {json.dumps(t.get('bucket'), ensure_ascii=False)}")
+                lines.append(f"bucket_path: {json.dumps(t.get('bucket_path'), ensure_ascii=False)}")
+                lines.append(f"tüm anahtarlar: {list(t.keys())}")
         except Exception as e:
             lines.append(f"Hesap {acct_id} hata: {e}")
 
