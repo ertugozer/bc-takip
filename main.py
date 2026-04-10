@@ -17,6 +17,8 @@ import smtplib
 from email.mime.text import MIMEText
 from datetime import datetime
 
+import requests as req_lib
+
 from flask import Flask, request, jsonify
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -127,30 +129,82 @@ def determine_status(todo: dict, last_comment: dict | None) -> tuple[str, str]:
 #  EXCEL OKUMA
 # ══════════════════════════════════════════════════════════════════════════
 
-def read_excel_tasks() -> list[dict]:
-    """SharePoint paylaşım linki üzerinden Excel dosyasını oku."""
+def _parse_excel_bytes(content: bytes) -> list[dict]:
+    """
+    Excel içeriğini parse eder.
+    Yapı:
+      - Satır 7: başlık (KİŞİ | Art Check | MARKA | İŞ | TO-DO LINK | ...)
+      - Satır 8+: veriler
+      - Kolon C (index 2): marka
+      - Kolon D (index 3): iş adı
+      - Kolon E (index 4): Basecamp URL (todo ID buradan çıkarılır)
+    Sadece Hopi ve Metro satırlarını döndürür.
+    """
     import openpyxl
-
-    sep = "&" if "?" in EXCEL_URL else "?"
-    download_url = EXCEL_URL + sep + "download=1"
-
-    req = urllib.request.Request(
-        download_url,
-        headers={"User-Agent": "Mozilla/5.0 (compatible; IsOzetRaporu)"},
-    )
-    with urllib.request.urlopen(req, timeout=30) as r:
-        content = r.read()
-
     wb = openpyxl.load_workbook(io.BytesIO(content), data_only=True)
     ws = wb.active
 
     tasks = []
-    for row in ws.iter_rows(min_row=2, values_only=True):
-        if row[0]:
-            name  = str(row[0]).strip()
-            brand = str(row[1]).strip() if len(row) > 1 and row[1] else ""
-            tasks.append({"name": name, "brand": brand})
+    seen_ids = set()
+
+    for row in ws.iter_rows(min_row=8, values_only=True):
+        task_name = row[3] if len(row) > 3 else None
+        brand_raw = row[2] if len(row) > 2 else None
+        bc_url    = str(row[4]) if len(row) > 4 and row[4] else ""
+
+        if not task_name:
+            continue
+
+        brand = str(brand_raw).strip() if brand_raw else ""
+        # Sadece Hopi ve Metro
+        if brand.lower().strip() not in ("hopi", "metro"):
+            continue
+
+        # Basecamp todo ID'sini URL'den çıkar
+        todo_id = None
+        if "/todos/" in bc_url:
+            raw_id = bc_url.split("/todos/")[-1].split("#")[0].strip()
+            if raw_id.isdigit():
+                todo_id = int(raw_id)
+
+        # Aynı ID'yi iki kez ekleme
+        key = todo_id if todo_id else str(task_name).strip().lower()
+        if key in seen_ids:
+            continue
+        seen_ids.add(key)
+
+        tasks.append({
+            "name":    str(task_name).strip(),
+            "brand":   brand,
+            "todo_id": todo_id,
+        })
+
     return tasks
+
+
+def read_excel_tasks() -> list[dict]:
+    """SharePoint paylaşım linki üzerinden Excel dosyasını oku."""
+    sep = "&" if "?" in EXCEL_URL else "?"
+    download_url = EXCEL_URL + sep + "download=1"
+
+    session = req_lib.Session()
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+    })
+
+    # İlk istek: SharePoint oturum çerezlerini al
+    r1 = session.get(EXCEL_URL, timeout=30, allow_redirects=True)
+
+    # İkinci istek: download=1 ile dosyayı indir
+    r2 = session.get(download_url, timeout=30, allow_redirects=True)
+    content = r2.content
+
+    if content[:2] != b"PK":
+        # İlk 200 karakteri logla (debug için)
+        preview = content[:200].decode("utf-8", errors="replace")
+        raise ValueError(f"xlsx değil, HTML/text geldi. Önizleme: {preview[:100]}")
+
+    return _parse_excel_bytes(content)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -212,16 +266,16 @@ def build_report(
 # ══════════════════════════════════════════════════════════════════════════
 
 def send_email(subject: str, body: str) -> None:
+    """Mail gönder. Railway SMTP bloke ediyorsa hata fırlatır (non-fatal)."""
     msg = MIMEText(body, "plain", "utf-8")
     msg["From"]    = GMAIL_USER
     msg["To"]      = RECIPIENT_EMAIL
     msg["Subject"] = subject
-    # Port 587 (STARTTLS) — Railway 465'i engelliyor
     with smtplib.SMTP("smtp.gmail.com", 587, timeout=30) as server:
         server.ehlo()
         server.starttls()
         server.login(GMAIL_USER, GMAIL_PASSWORD)
-        server.sendmail(GMAIL_USER, RECIPIENT_EMAIL, msg.as_string())
+        server.sendmail(GMAIL_USER, RECIPIENT_EMAIL, msg.as_bytes())
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -309,18 +363,29 @@ def run_report(trigger: str = "cron") -> str:
             excel_error = str(e)
             print(f"\n⚠️  Excel okunamadı: {e}")
 
-        active_bc_names = {t.get("title", "").lower().strip() for t in todos}
+        # ID bazlı eşleştirme (kolon E'den todo ID varsa) + isim fallback
+        active_bc_ids   = {t.get("id") for t in todos if t.get("id")}
+        active_bc_names = {
+            (todo.get("title") or todo.get("content") or todo.get("summary") or "").lower().strip()
+            for todo in todos
+        }
 
-        sil_listesi = [
-            t for t in excel_tasks
-            if t["name"].lower().strip() not in active_bc_names
-        ]
+        sil_listesi = []
+        for t in excel_tasks:
+            tid = t.get("todo_id")
+            matched = (tid and tid in active_bc_ids) or \
+                      (t["name"].lower().strip() in active_bc_names)
+            if not matched:
+                sil_listesi.append(t)
 
+        excel_ids   = {t["todo_id"] for t in excel_tasks if t.get("todo_id")}
         excel_names = {t["name"].lower().strip() for t in excel_tasks}
         ekle_listesi = []
         for todo in todos:
-            name = todo.get("title") or todo.get("content") or todo.get("summary") or "".strip()
-            if name.lower() not in excel_names:
+            tid  = todo.get("id")
+            name = (todo.get("title") or todo.get("content") or todo.get("summary") or "").strip()
+            in_excel = (tid and tid in excel_ids) or (name.lower() in excel_names)
+            if not in_excel:
                 project_raw = (todo.get("bucket") or {}).get("name", "")
                 brand       = TARGET_PROJECTS.get(project_raw.lower().strip(), project_raw)
                 ekle_listesi.append({"name": name, "brand": brand})
