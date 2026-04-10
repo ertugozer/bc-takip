@@ -222,7 +222,7 @@ def main():
     print("✅ Basecamp token alındı")
 
     # 2. Aktif görevleri çek
-    all_todos = bc_get(token, "assignments.json")
+    all_todos = bc_get(token, "my/assignments.json")
     print(f"📋 Toplam atanan görev: {len(all_todos)}")
 
     # 3. Sadece Hopi ve Metro projeleri
