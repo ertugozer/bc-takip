@@ -60,7 +60,7 @@ def bc_get(token: str, path: str) -> list:
         "Authorization": f"Bearer {token}",
         "User-Agent":    "IsOzetRaporu (ertugozerr@gmail.com)",
     }
-    url = f"https://3.basecamp.com/{BASECAMP_ACCOUNT_ID}/api/v1/{path}"
+    url = f"https://3.basecampapi.com/{BASECAMP_ACCOUNT_ID}/api/v1/{path}"
     results = []
 
     while url:
@@ -222,7 +222,7 @@ def main():
     print("✅ Basecamp token alındı")
 
     # 2. Aktif görevleri çek
-    all_todos = bc_get(token, "my/assignments.json")
+    all_todos = bc_get(token, "assignments.json")
     print(f"📋 Toplam atanan görev: {len(all_todos)}")
 
     # 3. Sadece Hopi ve Metro projeleri
