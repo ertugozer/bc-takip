@@ -246,7 +246,15 @@ def run_report(trigger: str = "cron") -> str:
         all_todos = []
         for acct_id in BASECAMP_ACCOUNT_IDS:
             try:
-                fetched = bc_get(token, acct_id, "my/assignments.json")
+                raw = bc_get(token, acct_id, "my/assignments.json")
+                # API {"priorities": [...], "non_priorities": [...]} döndürür
+                fetched = []
+                for item in raw:
+                    if isinstance(item, dict) and "priorities" in item:
+                        fetched.extend(item.get("priorities", []))
+                        fetched.extend(item.get("non_priorities", []))
+                    elif isinstance(item, dict) and item.get("title"):
+                        fetched.append(item)
                 print(f"📋 Hesap {acct_id}: {len(fetched)} görev")
                 for t in fetched:
                     t["_account_id"] = acct_id
@@ -346,13 +354,20 @@ def debug():
     lines = []
     for acct_id in BASECAMP_ACCOUNT_IDS:
         try:
-            todos = bc_get(token, acct_id, "my/assignments.json")
+            raw = bc_get(token, acct_id, "my/assignments.json")
+            todos = []
+            for item in raw:
+                if isinstance(item, dict) and "priorities" in item:
+                    todos.extend(item.get("priorities", []))
+                    todos.extend(item.get("non_priorities", []))
+                elif isinstance(item, dict) and item.get("title"):
+                    todos.append(item)
             lines.append(f"\n=== Hesap {acct_id} ({len(todos)} görev) ===")
             for t in todos:
-                lines.append(f"\n--- Görev: {t.get('title','')} ---")
-                lines.append(f"bucket: {json.dumps(t.get('bucket'), ensure_ascii=False)}")
-                lines.append(f"bucket_path: {json.dumps(t.get('bucket_path'), ensure_ascii=False)}")
-                lines.append(f"tüm anahtarlar: {list(t.keys())}")
+                bucket_name = (t.get("bucket") or {}).get("name", "YOK")
+                bucket_lower = bucket_name.lower().strip()
+                match = "✅" if bucket_lower in TARGET_PROJECTS else "❌"
+                lines.append(f"{match} [{repr(bucket_lower)}] {t.get('title','')}")
         except Exception as e:
             lines.append(f"Hesap {acct_id} hata: {e}")
 
