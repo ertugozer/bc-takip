@@ -347,6 +347,79 @@ def manual_run():
     return f"<pre>{report}</pre>", 200
 
 
+@app.route("/setup-webhooks")
+def setup_webhooks():
+    """
+    Basecamp'teki 'Metro - Dijital' ve 'Hopi - Sosyal Medya' projelerini bulur,
+    her birine bu sunucuyu işaret eden webhook kaydeder.
+    Tarayıcıdan bir kez çağır — otomatik halleder.
+    """
+    import socket
+    railway_url = f"https://{request.host}/webhook"
+    results = []
+
+    try:
+        token = get_access_token()
+    except Exception as e:
+        return f"<pre>❌ Token alınamadı: {e}</pre>", 500
+
+    for acct_id in BASECAMP_ACCOUNT_IDS:
+        try:
+            projects = bc_get(token, acct_id, "projects.json")
+        except Exception as e:
+            results.append(f"❌ Hesap {acct_id} proje listesi alınamadı: {e}")
+            continue
+
+        for proj in projects:
+            name = proj.get("name", "").lower().strip()
+            if name not in TARGET_PROJECTS:
+                continue
+
+            proj_id = proj["id"]
+            proj_name = proj["name"]
+
+            # Mevcut webhook'ları kontrol et
+            try:
+                existing = bc_get(token, acct_id, f"buckets/{proj_id}/webhooks.json")
+                already = any(
+                    w.get("payload_url") == railway_url
+                    for w in existing
+                )
+                if already:
+                    results.append(f"✅ {proj_name} — webhook zaten kayıtlı")
+                    continue
+            except Exception:
+                pass
+
+            # Webhook kaydet
+            payload = json.dumps({
+                "payload_url": railway_url,
+                "types": ["todo_assignment_created", "todo_completion_created",
+                          "message_created", "comment_created"],
+            }).encode()
+
+            headers = {
+                "Authorization": f"Bearer {token}",
+                "Content-Type":  "application/json",
+                "User-Agent":    "IsOzetRaporu (ertugozerr@gmail.com)",
+            }
+            req = urllib.request.Request(
+                f"https://3.basecampapi.com/{acct_id}/buckets/{proj_id}/webhooks.json",
+                data=payload,
+                headers=headers,
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=30) as r:
+                    resp = json.loads(r.read())
+                    results.append(f"✅ {proj_name} — webhook kaydedildi (ID: {resp.get('id')})")
+            except Exception as e:
+                results.append(f"❌ {proj_name} — webhook kaydedilemedi: {e}")
+
+    body = "\n".join(results) if results else "Hiç hedef proje bulunamadı!"
+    return f"<pre>{body}\n\nWebhook URL: {railway_url}</pre>", 200
+
+
 @app.route("/webhook", methods=["POST"])
 def basecamp_webhook():
     """
