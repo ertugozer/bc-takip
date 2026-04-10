@@ -391,10 +391,9 @@ def setup_webhooks():
             except Exception:
                 pass
 
-            # Webhook kaydet (types verilmezse tüm olayları dinler)
+            # Webhook kaydet — types belirtilmezse tüm olayları dinler
             payload = json.dumps({
                 "payload_url": railway_url,
-                "types": ["Todo", "TodoList", "Comment", "Message"],
             }).encode()
 
             headers = {
