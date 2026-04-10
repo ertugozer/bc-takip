@@ -2,7 +2,7 @@
 builder = "NIXPACKS"
 
 [deploy]
-# Her gün 15:00 UTC = 18:00 Türkiye saati (yaz saati UTC+3)
-# Kış için 16:00 UTC kullan (UTC+2)
-cronSchedule = "0 15 * * 1-5"
 startCommand = "python main.py"
+healthcheckPath = "/health"
+healthcheckTimeout = 30
+restartPolicyType = "ON_FAILURE"
