@@ -19,8 +19,6 @@ import json
 import threading
 import urllib.request
 import urllib.parse
-import smtplib
-from email.mime.text import MIMEText
 from datetime import datetime
 
 import requests as req_lib
@@ -36,8 +34,7 @@ BASECAMP_REFRESH_TOKEN = os.environ["BASECAMP_REFRESH_TOKEN"]
 BASECAMP_ACCOUNT_IDS   = ["4181631", "6168221"]
 
 EXCEL_URL       = os.environ["EXCEL_URL"]
-GMAIL_USER      = os.environ.get("GMAIL_USER", "")
-GMAIL_PASSWORD  = os.environ.get("GMAIL_APP_PASSWORD", "")
+RESEND_API_KEY  = os.environ.get("RESEND_API_KEY", "")
 RECIPIENT_EMAIL = os.environ.get("RECIPIENT_EMAIL", "ertugozerr@gmail.com")
 
 # ─── Hedef Proje İsimleri (tam eşleşme, küçük harf) ───────────────────────
@@ -256,15 +253,29 @@ def build_report(
 # ══════════════════════════════════════════════════════════════════════════
 
 def send_email(subject: str, body: str) -> None:
-    msg = MIMEText(body, "plain", "utf-8")
-    msg["From"]    = GMAIL_USER
-    msg["To"]      = RECIPIENT_EMAIL
-    msg["Subject"] = subject
-    with smtplib.SMTP("smtp.gmail.com", 587, timeout=30) as server:
-        server.ehlo()
-        server.starttls()
-        server.login(GMAIL_USER, GMAIL_PASSWORD)
-        server.sendmail(GMAIL_USER, RECIPIENT_EMAIL, msg.as_bytes())
+    """Resend HTTP API ile mail gönderir (Railway SMTP'yi bloklar, HTTP çalışır)."""
+    if not RESEND_API_KEY:
+        raise ValueError("RESEND_API_KEY env değişkeni ayarlanmamış")
+
+    payload = json.dumps({
+        "from":    "Excel Rapor <onboarding@resend.dev>",
+        "to":      [RECIPIENT_EMAIL],
+        "subject": subject,
+        "text":    body,
+    }).encode("utf-8")
+
+    req = urllib.request.Request(
+        "https://api.resend.com/emails",
+        data=payload,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {RESEND_API_KEY}",
+            "Content-Type":  "application/json",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=30) as r:
+        resp = json.loads(r.read())
+        print(f"✉️  Resend: {resp}")
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -393,7 +404,7 @@ def run_report(trigger: str = "cron") -> str:
         report = build_report(yesile_boya, aktif, sil_listesi, ekle_listesi, today, excel_error)
         print(f"\n{'═'*50}\n{report}\n{'═'*50}")
 
-        if GMAIL_USER and GMAIL_PASSWORD:
+        if RESEND_API_KEY:
             try:
                 send_email(f"📋 Excel Güncelleme Talimatları — {today}", report)
                 print("✉️  Mail gönderildi!")
