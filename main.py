@@ -139,28 +139,58 @@ def is_marka_onayinda(todo: dict) -> bool:
 #  EXCEL OKUMA
 # ══════════════════════════════════════════════════════════════════════════
 
+def _is_green_cell(cell) -> bool:
+    """Hücrenin dolgu rengi yeşil mi? (FF92D050 ve benzeri yeşil tonları)"""
+    try:
+        fill = cell.fill
+        if not fill or fill.fill_type != "solid":
+            return False
+        fg = fill.fgColor
+        if fg.type != "rgb":
+            return False
+        rgb = fg.rgb  # örn. "FF92D050"
+        if len(rgb) != 8:
+            return False
+        r = int(rgb[2:4], 16)
+        g = int(rgb[4:6], 16)
+        b = int(rgb[6:8], 16)
+        # Yeşil: G en yüksek ve belirgin biçimde dominant
+        return g > 150 and g > r and g > b
+    except Exception:
+        return False
+
+
 def _parse_excel_bytes(content: bytes) -> list[dict]:
     """
     Yapı: Satır 7 = başlık, Satır 8+ = veriler
     Kolon C = marka, D = iş adı, E = Basecamp URL
     Sadece Hopi ve Metro satırlarını döndürür.
     URL formatı: https://3.basecamp.com/{account_id}/buckets/{bucket_id}/todos/{todo_id}
+    already_green: D sütunu hücre rengi yeşilse True (Excel'de zaten yeşile boyanmış)
     """
     import openpyxl
     wb = openpyxl.load_workbook(io.BytesIO(content), data_only=True)
     ws = wb.active
 
     tasks, seen = [], set()
-    for row in ws.iter_rows(min_row=8, values_only=True):
-        task_name = row[3] if len(row) > 3 else None
-        brand_raw = row[2] if len(row) > 2 else None
-        bc_url    = str(row[4]) if len(row) > 4 and row[4] else ""
+    for row in ws.iter_rows(min_row=8):          # values_only=False → renk okumak için
+        if len(row) < 4:
+            continue
+        cell_brand = row[2]
+        cell_name  = row[3]
+        cell_url   = row[4] if len(row) > 4 else None
+
+        task_name = cell_name.value
+        brand_raw = cell_brand.value
+        bc_url    = str(cell_url.value) if cell_url and cell_url.value else ""
 
         if not task_name:
             continue
         brand = str(brand_raw).strip() if brand_raw else ""
         if brand.lower().strip() not in ("hopi", "metro"):
             continue
+
+        already_green = _is_green_cell(cell_name) or _is_green_cell(cell_brand)
 
         todo_id = None
         bucket_id = None
@@ -170,10 +200,8 @@ def _parse_excel_bytes(content: bytes) -> list[dict]:
             raw_id = bc_url.split("/todos/")[-1].split("#")[0].strip()
             if raw_id.isdigit():
                 todo_id = int(raw_id)
-            # https://3.basecamp.com/{account_id}/buckets/{bucket_id}/todos/{todo_id}
             try:
                 parts = bc_url.split("/")
-                # parts: ['https:', '', '3.basecamp.com', '{acct}', 'buckets', '{bid}', 'todos', '{tid}']
                 if "buckets" in parts:
                     bi = parts.index("buckets")
                     bucket_id = int(parts[bi + 1]) if parts[bi + 1].isdigit() else None
@@ -187,11 +215,12 @@ def _parse_excel_bytes(content: bytes) -> list[dict]:
         seen.add(key)
 
         tasks.append({
-            "name": str(task_name).strip(),
-            "brand": brand,
-            "todo_id": todo_id,
-            "bucket_id": bucket_id,
+            "name":           str(task_name).strip(),
+            "brand":          brand,
+            "todo_id":        todo_id,
+            "bucket_id":      bucket_id,
             "url_account_id": url_account_id,
+            "already_green":  already_green,
         })
     return tasks
 
@@ -473,8 +502,11 @@ def run_report(trigger: str = "cron") -> str:
                 elif info["produksiyon"]:
                     print(f"  ⏭️  [SKIP - prodüksiyon aktif] {t['name']}")
                 elif "marka onay" in info["list_name"]:
-                    yesile_boya.append({**t, "id": tid})
-                    print(f"  🟢 [MARKA ONAYINDA - başka kişi] {t['name']}")
+                    if not t.get("already_green"):
+                        yesile_boya.append({**t, "id": tid})
+                        print(f"  🟢 [MARKA ONAYINDA - başka kişi] {t['name']}")
+                    else:
+                        print(f"  ✅ [ZATEN YEŞİL - başka kişi] {t['name']}")
                 else:
                     aktif.append({**t, "id": tid})
                     print(f"  📋 [AKTİF - başka kişi] {t['name']} ({info['list_name']})")
@@ -501,8 +533,18 @@ def run_report(trigger: str = "cron") -> str:
                     "yesile_boya": is_marka_onayinda(todo),
                 })
 
-        # EKLE'de olan işleri YEŞİLE BOYA listesinden çıkar (çakışma önleme)
-        # (Zaten Excel'de olmadığı için "yeşile boya" değil "ekle + yeşile boya" yapılacak)
+        # Excel'de zaten yeşil olan satırları belirle
+        excel_green_ids   = {t["todo_id"] for t in excel_tasks if t.get("already_green") and t.get("todo_id")}
+        excel_green_names = {t["name"].lower() for t in excel_tasks if t.get("already_green")}
+
+        # YEŞİLE BOYA listesinden: zaten Excel'de yeşil olanları çıkar
+        yesile_boya = [
+            y for y in yesile_boya
+            if not ((y.get("id") and y.get("id") in excel_green_ids) or
+                    y["name"].lower() in excel_green_names)
+        ]
+
+        # EKLE'de olan işleri YEŞİLE BOYA ve AKTİF listesinden çıkar (çakışma önleme)
         ekle_names = {t["name"].lower() for t in ekle_listesi}
         ekle_ids   = {t.get("todo_id") for t in ekle_listesi if t.get("todo_id")}
         yesile_boya = [
