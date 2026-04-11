@@ -19,6 +19,7 @@ import json
 import threading
 import urllib.request
 import urllib.parse
+import urllib.error
 from datetime import datetime
 
 import requests as req_lib
@@ -273,9 +274,13 @@ def send_email(subject: str, body: str) -> None:
             "Content-Type":  "application/json",
         },
     )
-    with urllib.request.urlopen(req, timeout=30) as r:
-        resp = json.loads(r.read())
-        print(f"✉️  Resend: {resp}")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            resp = json.loads(r.read())
+            print(f"✉️  Resend: {resp}")
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")
+        raise Exception(f"Resend {e.code}: {body}")
 
 
 # ══════════════════════════════════════════════════════════════════════════
