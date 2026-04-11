@@ -140,7 +140,7 @@ def is_marka_onayinda(todo: dict) -> bool:
 # ══════════════════════════════════════════════════════════════════════════
 
 def _is_green_cell(cell) -> bool:
-    """Hücrenin dolgu rengi yeşil mi? (FF92D050 ve benzeri yeşil tonları)"""
+    """Hücre yeşil mi? Diğer tüm renkler (sarı, mor, kırmızı, mavi) renksiz sayılır."""
     try:
         fill = cell.fill
         if not fill or fill.fill_type != "solid":
@@ -148,14 +148,13 @@ def _is_green_cell(cell) -> bool:
         fg = fill.fgColor
         if fg.type != "rgb":
             return False
-        rgb = fg.rgb  # örn. "FF92D050"
-        if len(rgb) != 8:
+        rgb = fg.rgb
+        if len(rgb) != 8 or rgb in ("00000000", "FF000000"):
             return False
         r = int(rgb[2:4], 16)
         g = int(rgb[4:6], 16)
         b = int(rgb[6:8], 16)
-        # Yeşil: G en yüksek ve belirgin biçimde dominant
-        return g > 150 and g > r and g > b
+        return g > 150 and g > r * 0.9 and g > b
     except Exception:
         return False
 
@@ -190,7 +189,7 @@ def _parse_excel_bytes(content: bytes) -> list[dict]:
         if brand.lower().strip() not in ("hopi", "metro"):
             continue
 
-        already_green = _is_green_cell(cell_name) or _is_green_cell(cell_brand)
+        cell_color = "green" if (_is_green_cell(cell_name) or _is_green_cell(cell_brand)) else "none"
 
         todo_id = None
         bucket_id = None
@@ -220,7 +219,7 @@ def _parse_excel_bytes(content: bytes) -> list[dict]:
             "todo_id":        todo_id,
             "bucket_id":      bucket_id,
             "url_account_id": url_account_id,
-            "already_green":  already_green,
+            "cell_color":     cell_color,
         })
     return tasks
 
@@ -261,13 +260,13 @@ def load_state() -> dict:
         return {}
 
 
-def save_state(sil: list, yesile: list, aktif: list, ekle: list, timestamp: str):
+def save_state(sil: list, yesile: list, renksiz: list, ekle: list, timestamp: str):
     state = {
         "timestamp": timestamp,
-        "sil":    [t["name"] for t in sil],
-        "yesile": [t["name"] for t in yesile],
-        "aktif":  [t["name"] for t in aktif],
-        "ekle":   [t["name"] for t in ekle],
+        "sil":     [t["name"] for t in sil],
+        "yesile":  [t["name"] for t in yesile],
+        "renksiz": [t["name"] for t in renksiz],
+        "ekle":    [t["name"] for t in ekle],
     }
     try:
         with open(STATE_FILE, "w", encoding="utf-8") as f:
@@ -276,7 +275,7 @@ def save_state(sil: list, yesile: list, aktif: list, ekle: list, timestamp: str)
         print(f"⚠️  State kayıt hatası: {e}")
 
 
-def compute_changes(prev: dict, sil: list, yesile: list, aktif: list, ekle: list) -> list[str]:
+def compute_changes(prev: dict, sil: list, yesile: list, renksiz: list, ekle: list) -> list[str]:
     """Önceki rapor ile karşılaştırarak değişiklikleri döndürür."""
     if not prev:
         return []
@@ -284,12 +283,12 @@ def compute_changes(prev: dict, sil: list, yesile: list, aktif: list, ekle: list
 
     curr_sil    = {t["name"] for t in sil}
     curr_yesile = {t["name"] for t in yesile}
-    curr_aktif  = {t["name"] for t in aktif}
+    curr_renksiz = {t["name"] for t in renksiz}
     curr_ekle   = {t["name"] for t in ekle}
 
     prev_sil    = set(prev.get("sil", []))
     prev_yesile = set(prev.get("yesile", []))
-    prev_aktif  = set(prev.get("aktif", []))
+    prev_renksiz = set(prev.get("renksiz", []))
     prev_ekle   = set(prev.get("ekle", []))
 
     # Yeni tamamlananlar (yeni SİL'e girenler)
@@ -307,10 +306,10 @@ def compute_changes(prev: dict, sil: list, yesile: list, aktif: list, ekle: list
     if yeni_onay:
         changes.append("Marka onayına geldi: " + ", ".join(sorted(yeni_onay)))
 
-    # Onaydan çıkanlar
-    onaydan_cikti = prev_yesile - curr_yesile
+    # Onaydan çıkıp renksiz yapılması gerekenler
+    onaydan_cikti = curr_renksiz - prev_renksiz
     if onaydan_cikti:
-        changes.append("Onaydan çıktı: " + ", ".join(sorted(onaydan_cikti)))
+        changes.append("Onaydan çıktı (renksiz yap): " + ", ".join(sorted(onaydan_cikti)))
 
     # Yeni eklenen Basecamp işleri
     yeni_bc = curr_ekle - prev_ekle
@@ -322,7 +321,7 @@ def compute_changes(prev: dict, sil: list, yesile: list, aktif: list, ekle: list
 
 def build_report(
     yesile_boya: list,
-    aktif: list,
+    renksiz_yap: list,
     sil_listesi: list,
     ekle_listesi: list,
     today: str,
@@ -343,23 +342,22 @@ def build_report(
     if excel_error:
         lines += [f"⚠️  Excel okunamadı: {excel_error}", ""]
 
-    # Değişiklikler özeti
     if changes:
         lines.append("🔄 SON RAPORDAN DEĞİŞİKLİKLER:")
         for c in changes:
             lines.append(f"  • {c}")
         lines.append("")
 
-    lines.append("🗑️  SİL (Basecamp'te tamamlandı / artık listede yok):")
+    lines.append("🗑️  SİL (Basecamp'te tamamlandı):")
     lines += fmt(sil_listesi)
     lines.append("")
 
-    lines.append("🟢 YEŞİLE BOYA (Marka Onayında listesinde):")
+    lines.append("🟢 YEŞİLE BOYA (Marka Onayında — Excel'de henüz yeşil değil):")
     lines += fmt(yesile_boya)
     lines.append("")
 
-    lines.append("📋 AKTİF — renksiz bırak (Tasarım / SM&PM ekibinde):")
-    lines += fmt(aktif)
+    lines.append("⬜ RENKSİZ YAP (Artık Marka Onayında değil — Excel'de hâlâ yeşil):")
+    lines += fmt(renksiz_yap)
     lines.append("")
 
     lines.append("➕ EXCEL'E EKLE (Basecamp'te var, Excel'de yok):")
@@ -446,24 +444,6 @@ def run_report(trigger: str = "cron") -> str:
         print(f"🎯 Hedef projelerde aktif görev: {len(todos)}")
 
         # Durum kategorileri
-        yesile_boya, aktif = [], []
-        for todo in todos:
-            # Prodüksiyon işleri → rapora dahil etme
-            if is_produksiyon(todo):
-                continue
-
-            project_raw = (todo.get("bucket") or {}).get("name", "")
-            brand = TARGET_PROJECTS.get(project_raw.lower().strip(), project_raw)
-            name  = get_todo_title(todo)
-            item  = {"name": name, "brand": brand, "id": todo.get("id")}
-
-            if is_marka_onayinda(todo):
-                yesile_boya.append(item)
-                print(f"  🟢 [MARKA ONAYINDA] {name}")
-            else:
-                aktif.append(item)
-                print(f"  📋 [AKTİF] {name} ({get_todolist_name(todo)})")
-
         # Excel oku
         excel_error = ""
         excel_tasks = []
@@ -474,23 +454,61 @@ def run_report(trigger: str = "cron") -> str:
             excel_error = str(e)
             print(f"⚠️  Excel: {e}")
 
-        # Aktif Basecamp ID ve isimlerini topla
-        active_bc_ids   = {t["id"] for t in todos if t.get("id")}
-        active_bc_names = {get_todo_title(t).lower() for t in todos}
+        # Excel lookup tabloları
+        excel_by_id   = {t["todo_id"]: t for t in excel_tasks if t.get("todo_id")}
+        excel_by_name = {t["name"].lower(): t for t in excel_tasks}
+        processed_keys = set()   # işlenmiş Excel item'ları
 
-        # Excel'de var ama Basecamp'te aktif değil → SİL / kategorize et
-        # my/assignments.json sadece Ertuğ'a atananları döndürür.
-        # Başka kişilere atananlar için doğrudan API'ye sorulur + durum belirlenir.
-        sil_listesi = []
+        yesile_boya  = []   # Marka Onayında ama Excel'de yeşil değil
+        renksiz_yap  = []   # Excel'de yeşil ama artık Marka Onayında değil
+        sil_listesi  = []   # Basecamp'te tamamlandı
+        ekle_listesi = []   # Basecamp'te var, Excel'de yok
+
+        # ── PASS 1: Ertuğ'a atanmış Basecamp todoları ──────────────────────
+        for todo in todos:
+            if is_produksiyon(todo):
+                continue
+
+            tid   = todo.get("id")
+            name  = get_todo_title(todo)
+            project_raw = (todo.get("bucket") or {}).get("name", "")
+            brand = TARGET_PROJECTS.get(project_raw.lower().strip(), project_raw)
+            bc_onay = is_marka_onayinda(todo)
+
+            excel_item = excel_by_id.get(tid) or excel_by_name.get(name.lower())
+
+            if excel_item:
+                key = excel_item.get("todo_id") or excel_item["name"].lower()
+                processed_keys.add(key)
+                is_green = excel_item.get("cell_color") == "green"
+
+                if bc_onay and not is_green:
+                    yesile_boya.append({"name": name, "brand": brand, "id": tid})
+                    print(f"  🟢 [YEŞİLE BOYA] {name}")
+                elif not bc_onay and is_green:
+                    renksiz_yap.append({"name": name, "brand": brand, "id": tid})
+                    print(f"  ⬜ [RENKSİZ YAP] {name}")
+                else:
+                    print(f"  ✅ [DOĞRU RENK] {name}")
+            else:
+                # Excel'de yok → EKLE
+                ekle_listesi.append({
+                    "name": name, "brand": brand,
+                    "yesile_boya": bc_onay,
+                })
+                print(f"  ➕ [EKLE] {name}")
+
+        # ── PASS 2: Excel'de olup Ertuğ'a atanmamış todoları ───────────────
         for t in excel_tasks:
-            tid = t.get("todo_id")
-            matched = (tid and tid in active_bc_ids) or \
-                      (t["name"].lower().strip() in active_bc_names)
-            if matched:
-                continue  # Ertuğ'un listesinde var → zaten yesile/aktif'te
+            key = t.get("todo_id") or t["name"].lower()
+            if key in processed_keys:
+                continue
 
+            tid       = t.get("todo_id")
             bucket_id = t.get("bucket_id")
             url_acct  = t.get("url_account_id")
+            is_green  = t.get("cell_color") == "green"
+
             if tid and bucket_id and url_acct:
                 info = get_todo_info(token, url_acct, bucket_id, tid)
                 if info is None:
@@ -500,70 +518,30 @@ def run_report(trigger: str = "cron") -> str:
                     sil_listesi.append(t)
                     print(f"  🗑️  [SİL - tamamlandı] {t['name']}")
                 elif info["produksiyon"]:
-                    print(f"  ⏭️  [SKIP - prodüksiyon aktif] {t['name']}")
+                    print(f"  ⏭️  [SKIP - prodüksiyon] {t['name']}")
                 elif "marka onay" in info["list_name"]:
-                    if not t.get("already_green"):
+                    if not is_green:
                         yesile_boya.append({**t, "id": tid})
-                        print(f"  🟢 [MARKA ONAYINDA - başka kişi] {t['name']}")
+                        print(f"  🟢 [YEŞİLE BOYA - başka kişi] {t['name']}")
                     else:
-                        print(f"  ✅ [ZATEN YEŞİL - başka kişi] {t['name']}")
+                        print(f"  ✅ [DOĞRU RENK - başka kişi] {t['name']}")
                 else:
-                    aktif.append({**t, "id": tid})
-                    print(f"  📋 [AKTİF - başka kişi] {t['name']} ({info['list_name']})")
+                    if is_green:
+                        renksiz_yap.append({**t, "id": tid})
+                        print(f"  ⬜ [RENKSİZ YAP - başka kişi] {t['name']}")
+                    else:
+                        print(f"  ✅ [DOĞRU RENK - başka kişi] {t['name']}")
             else:
+                # URL yok → sadece SİL listesine ekle (teyit edilemiyor)
                 sil_listesi.append(t)
                 print(f"  🗑️  [SİL - URL yok] {t['name']}")
 
-        # Basecamp'te var ama Excel'de yok → EKLE
-        excel_ids   = {t["todo_id"] for t in excel_tasks if t.get("todo_id")}
-        excel_names = {t["name"].lower().strip() for t in excel_tasks}
-        ekle_listesi = []
-        for todo in todos:
-            if is_produksiyon(todo):
-                continue
-            tid  = todo.get("id")
-            name = get_todo_title(todo)
-            if not ((tid and tid in excel_ids) or (name.lower() in excel_names)):
-                project_raw = (todo.get("bucket") or {}).get("name", "")
-                brand = TARGET_PROJECTS.get(project_raw.lower().strip(), project_raw)
-                # Marka Onayında ise EKLE'de yeşil notu ekle
-                ekle_listesi.append({
-                    "name": name,
-                    "brand": brand,
-                    "yesile_boya": is_marka_onayinda(todo),
-                })
-
-        # Excel'de zaten yeşil olan satırları belirle
-        excel_green_ids   = {t["todo_id"] for t in excel_tasks if t.get("already_green") and t.get("todo_id")}
-        excel_green_names = {t["name"].lower() for t in excel_tasks if t.get("already_green")}
-
-        # YEŞİLE BOYA listesinden: zaten Excel'de yeşil olanları çıkar
-        yesile_boya = [
-            y for y in yesile_boya
-            if not ((y.get("id") and y.get("id") in excel_green_ids) or
-                    y["name"].lower() in excel_green_names)
-        ]
-
-        # EKLE'de olan işleri YEŞİLE BOYA ve AKTİF listesinden çıkar (çakışma önleme)
-        ekle_names = {t["name"].lower() for t in ekle_listesi}
-        ekle_ids   = {t.get("todo_id") for t in ekle_listesi if t.get("todo_id")}
-        yesile_boya = [
-            y for y in yesile_boya
-            if not (y["name"].lower() in ekle_names or
-                    (y.get("id") and y.get("id") in ekle_ids))
-        ]
-        aktif = [
-            a for a in aktif
-            if not (a["name"].lower() in ekle_names or
-                    (a.get("id") and a.get("id") in ekle_ids))
-        ]
-
         # Geçmiş durum yükle → değişiklikleri hesapla
         prev_state = load_state()
-        changes = compute_changes(prev_state, sil_listesi, yesile_boya, aktif, ekle_listesi)
-        save_state(sil_listesi, yesile_boya, aktif, ekle_listesi, today)
+        changes = compute_changes(prev_state, sil_listesi, yesile_boya, renksiz_yap, ekle_listesi)
+        save_state(sil_listesi, yesile_boya, renksiz_yap, ekle_listesi, today)
 
-        report = build_report(yesile_boya, aktif, sil_listesi, ekle_listesi, today, excel_error, changes)
+        report = build_report(yesile_boya, renksiz_yap, sil_listesi, ekle_listesi, today, excel_error, changes)
         print(f"\n{'═'*50}\n{report}\n{'═'*50}")
 
         if BREVO_API_KEY:
