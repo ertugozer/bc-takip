@@ -97,6 +97,25 @@ def bc_get(token: str, account_id: str, path: str) -> list:
     return results
 
 
+def check_todo_completed(token: str, account_id: str, bucket_id, todo_id) -> bool | None:
+    """
+    Belirtilen todo'nun tamamlanıp tamamlanmadığını doğrudan API'den kontrol eder.
+    Döner: True = tamamlandı, False = aktif, None = bulunamadı / hata
+    """
+    try:
+        items = bc_get(token, account_id, f"buckets/{bucket_id}/todos/{todo_id}.json")
+        if items:
+            todo = items[0]
+            return bool(todo.get("completed", False))
+        return None
+    except Exception as e:
+        err_str = str(e)
+        if "404" in err_str:
+            return None   # silinmiş / bulunamadı
+        print(f"⚠️  check_todo_completed({account_id}/{bucket_id}/{todo_id}): {e}")
+        return None
+
+
 def get_todo_title(todo: dict) -> str:
     return (todo.get("title") or todo.get("content") or todo.get("summary") or "").strip()
 
@@ -123,6 +142,7 @@ def _parse_excel_bytes(content: bytes) -> list[dict]:
     Yapı: Satır 7 = başlık, Satır 8+ = veriler
     Kolon C = marka, D = iş adı, E = Basecamp URL
     Sadece Hopi ve Metro satırlarını döndürür.
+    URL formatı: https://3.basecamp.com/{account_id}/buckets/{bucket_id}/todos/{todo_id}
     """
     import openpyxl
     wb = openpyxl.load_workbook(io.BytesIO(content), data_only=True)
@@ -141,17 +161,36 @@ def _parse_excel_bytes(content: bytes) -> list[dict]:
             continue
 
         todo_id = None
+        bucket_id = None
+        url_account_id = None
+
         if "/todos/" in bc_url:
             raw_id = bc_url.split("/todos/")[-1].split("#")[0].strip()
             if raw_id.isdigit():
                 todo_id = int(raw_id)
+            # https://3.basecamp.com/{account_id}/buckets/{bucket_id}/todos/{todo_id}
+            try:
+                parts = bc_url.split("/")
+                # parts: ['https:', '', '3.basecamp.com', '{acct}', 'buckets', '{bid}', 'todos', '{tid}']
+                if "buckets" in parts:
+                    bi = parts.index("buckets")
+                    bucket_id = int(parts[bi + 1]) if parts[bi + 1].isdigit() else None
+                    url_account_id = parts[3] if parts[3].isdigit() else None
+            except Exception:
+                pass
 
         key = todo_id if todo_id else str(task_name).strip().lower()
         if key in seen:
             continue
         seen.add(key)
 
-        tasks.append({"name": str(task_name).strip(), "brand": brand, "todo_id": todo_id})
+        tasks.append({
+            "name": str(task_name).strip(),
+            "brand": brand,
+            "todo_id": todo_id,
+            "bucket_id": bucket_id,
+            "url_account_id": url_account_id,
+        })
     return tasks
 
 
@@ -305,13 +344,37 @@ def run_report(trigger: str = "cron") -> str:
         active_bc_names = {get_todo_title(t).lower() for t in todos}
 
         # Excel'de var ama Basecamp'te aktif değil → SİL
+        # Ama önce: my/assignments.json sadece Ertuğ'a atanmış işleri döndürür.
+        # Dilara/Derin'e atanan aktif işler orada görünmez → yanlış SİL'e düşer.
+        # Çözüm: eşleşmeyen Excel item'ları için doğrudan Basecamp API'sine soruyoruz.
         sil_listesi = []
         for t in excel_tasks:
             tid = t.get("todo_id")
             matched = (tid and tid in active_bc_ids) or \
                       (t["name"].lower().strip() in active_bc_names)
-            if not matched:
+            if matched:
+                continue  # Ertuğ'un listesinde var, aktif → SİL değil
+
+            # Ertuğ'un listesinde yok — doğrudan API'ye sor
+            bucket_id = t.get("bucket_id")
+            url_acct  = t.get("url_account_id")
+            if tid and bucket_id and url_acct:
+                completed = check_todo_completed(token, url_acct, bucket_id, tid)
+                if completed is True:
+                    # Basecamp'te gerçekten tamamlanmış → SİL
+                    sil_listesi.append(t)
+                    print(f"  🗑️  [SİL - tamamlandı] {t['name']}")
+                elif completed is False:
+                    # Aktif ama başka birine atanmış → SİL değil
+                    print(f"  ⏭️  [AKTİF - başka kişi] {t['name']}")
+                else:
+                    # 404 veya bulunamadı → silinmiş/arşivlenmiş → SİL
+                    sil_listesi.append(t)
+                    print(f"  🗑️  [SİL - bulunamadı] {t['name']}")
+            else:
+                # URL bilgisi yok → isim eşleşmesi yok → SİL
                 sil_listesi.append(t)
+                print(f"  🗑️  [SİL - URL yok] {t['name']}")
 
         # Basecamp'te var ama Excel'de yok → EKLE
         excel_ids   = {t["todo_id"] for t in excel_tasks if t.get("todo_id")}
@@ -396,6 +459,23 @@ def debug():
             lines.append(f"Hata: {e}")
 
     return f"<pre>{chr(10).join(lines)}</pre>", 200
+
+
+@app.route("/debug-excel")
+def debug_excel():
+    """Excel'den okunan item'ları ve URL ayrıştırmasını gösterir."""
+    try:
+        tasks = read_excel_tasks()
+    except Exception as e:
+        return f"<pre>Excel hatası: {e}</pre>", 500
+
+    lines = [f"Excel'den {len(tasks)} iş okundu:\n"]
+    for t in tasks:
+        lines.append(
+            f"[{t['brand']}] {t['name']}\n"
+            f"  todo_id={t.get('todo_id')} bucket_id={t.get('bucket_id')} acct={t.get('url_account_id')}\n"
+        )
+    return f"<pre>{''.join(lines)}</pre>", 200
 
 
 @app.route("/setup-webhooks")
