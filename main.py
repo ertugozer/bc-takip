@@ -35,7 +35,7 @@ BASECAMP_REFRESH_TOKEN = os.environ["BASECAMP_REFRESH_TOKEN"]
 BASECAMP_ACCOUNT_IDS   = ["4181631", "6168221"]
 
 EXCEL_URL       = os.environ["EXCEL_URL"]
-RESEND_API_KEY  = os.environ.get("RESEND_API_KEY", "")
+BREVO_API_KEY   = os.environ.get("BREVO_API_KEY", "")
 RECIPIENT_EMAIL = os.environ.get("RECIPIENT_EMAIL", "ertugozerr@gmail.com")
 
 # ─── Hedef Proje İsimleri (tam eşleşme, küçük harf) ───────────────────────
@@ -254,33 +254,33 @@ def build_report(
 # ══════════════════════════════════════════════════════════════════════════
 
 def send_email(subject: str, body: str) -> None:
-    """Resend HTTP API ile mail gönderir (Railway SMTP'yi bloklar, HTTP çalışır)."""
-    if not RESEND_API_KEY:
-        raise ValueError("RESEND_API_KEY env değişkeni ayarlanmamış")
+    """Brevo (Sendinblue) HTTP API ile mail gönderir."""
+    if not BREVO_API_KEY:
+        raise ValueError("BREVO_API_KEY env değişkeni ayarlanmamış")
 
     payload = json.dumps({
-        "from":    "Excel Rapor <onboarding@resend.dev>",
-        "to":      [RECIPIENT_EMAIL],
-        "subject": subject,
-        "text":    body,
+        "sender":      {"name": "Excel Rapor", "email": RECIPIENT_EMAIL},
+        "to":          [{"email": RECIPIENT_EMAIL}],
+        "subject":     subject,
+        "textContent": body,
     }).encode("utf-8")
 
     req = urllib.request.Request(
-        "https://api.resend.com/emails",
+        "https://api.brevo.com/v3/smtp/email",
         data=payload,
         method="POST",
         headers={
-            "Authorization": f"Bearer {RESEND_API_KEY}",
-            "Content-Type":  "application/json",
+            "api-key":      BREVO_API_KEY,
+            "Content-Type": "application/json",
         },
     )
     try:
         with urllib.request.urlopen(req, timeout=30) as r:
             resp = json.loads(r.read())
-            print(f"✉️  Resend: {resp}")
+            print(f"✉️  Brevo: {resp}")
     except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", errors="replace")
-        raise Exception(f"Resend {e.code}: {body}")
+        err_body = e.read().decode("utf-8", errors="replace")
+        raise Exception(f"Brevo {e.code}: {err_body}")
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -409,7 +409,7 @@ def run_report(trigger: str = "cron") -> str:
         report = build_report(yesile_boya, aktif, sil_listesi, ekle_listesi, today, excel_error)
         print(f"\n{'═'*50}\n{report}\n{'═'*50}")
 
-        if RESEND_API_KEY:
+        if BREVO_API_KEY:
             try:
                 send_email(f"📋 Excel Güncelleme Talimatları — {today}", report)
                 print("✉️  Mail gönderildi!")
