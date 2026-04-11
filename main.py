@@ -5,6 +5,12 @@ Basecamp–Excel Karşılaştırma Raporu
 - Basecamp webhook geldiğinde de tetiklenir (/webhook)
 - Manuel tetikleme için /run endpoint'i
 - Sadece okur, hiçbir yerde değişiklik yapmaz
+
+Durum tespiti: yorum okuma yok — sadece todo'nun bulunduğu listenin adına bakılır.
+  "Marka Onayında" listesi → YEŞİLE BOYA
+  Tamamlanmış (completed) → Excel'de kalmışsa SİL
+  Diğerleri (Tasarım Ekibinde, SM&PM vs.) → aktif, renksiz
+  Prodüksiyon işleri → sadece completedsa SİL, aktifse rapora dahil edilmez
 """
 
 import os
@@ -34,17 +40,16 @@ GMAIL_USER      = os.environ.get("GMAIL_USER", "")
 GMAIL_PASSWORD  = os.environ.get("GMAIL_APP_PASSWORD", "")
 RECIPIENT_EMAIL = os.environ.get("RECIPIENT_EMAIL", "ertugozerr@gmail.com")
 
-# ─── Hedef Proje İsimleri (tam eşleşme) ───────────────────────────────────
+# ─── Hedef Proje İsimleri (tam eşleşme, küçük harf) ───────────────────────
 TARGET_PROJECTS = {
     "metro - dijital": "Metro",
     "hopi - sosyal medya": "Hopi",
 }
 
-# ─── Kişi Listeleri ────────────────────────────────────────────────────────
-TASARIM_KISILER = ["sümeyye", "sumeyye", "dilara", "özge", "ozge"]
-KREATIF_KISILER = ["oya", "derin", "önder", "onder", "ömür", "omur"]
+# Prodüksiyon listesi — aktifse rapora dahil etme, completedsa SİL
+PRODUKSIYON_LIST_KEYWORDS = ["prodüksiyon", "produksiyon", "production"]
 
-# ─── Webhook lock (aynı anda birden fazla çalışmasın) ─────────────────────
+# Webhook lock
 _report_lock = threading.Lock()
 
 app = Flask(__name__)
@@ -55,7 +60,6 @@ app = Flask(__name__)
 # ══════════════════════════════════════════════════════════════════════════
 
 def get_access_token() -> str:
-    """Refresh token ile yeni access token al."""
     data = urllib.parse.urlencode({
         "type":          "refresh",
         "client_id":     BASECAMP_CLIENT_ID,
@@ -80,7 +84,6 @@ def bc_get(token: str, account_id: str, path: str) -> list:
     }
     url = f"https://3.basecampapi.com/{account_id}/{path}"
     results = []
-
     while url:
         req = urllib.request.Request(url, headers=headers)
         with urllib.request.urlopen(req, timeout=30) as r:
@@ -94,35 +97,21 @@ def bc_get(token: str, account_id: str, path: str) -> list:
     return results
 
 
-def get_last_comment(token: str, account_id: str, bucket_id: int, recording_id: int) -> dict | None:
-    """Görevin son yorumunu döndür, yoksa None."""
-    try:
-        comments = bc_get(
-            token, account_id,
-            f"buckets/{bucket_id}/recordings/{recording_id}/comments.json"
-        )
-        return comments[-1] if comments else None
-    except Exception:
-        return None
+def get_todo_title(todo: dict) -> str:
+    return (todo.get("title") or todo.get("content") or todo.get("summary") or "").strip()
 
 
-def determine_status(todo: dict, last_comment: dict | None) -> tuple[str, str]:
-    """(durum, son_yorum_kisi) döndür."""
-    todolist_name = (todo.get("parent") or {}).get("title", "").lower()
-    if "marka onay" in todolist_name:
-        return "MARKA_ONAYINDA", ""
+def get_todolist_name(todo: dict) -> str:
+    return (todo.get("parent") or {}).get("title", "").lower().strip()
 
-    if last_comment:
-        creator_name  = (last_comment.get("creator") or {}).get("name", "")
-        creator_lower = creator_name.lower()
-        for name in TASARIM_KISILER:
-            if name in creator_lower:
-                return "TASARIMDA", creator_name
-        for name in KREATIF_KISILER:
-            if name in creator_lower:
-                return "ONAYDA", creator_name
 
-    return "BELIRSIZ", ""
+def is_produksiyon(todo: dict) -> bool:
+    name = get_todolist_name(todo)
+    return any(k in name for k in PRODUKSIYON_LIST_KEYWORDS)
+
+
+def is_marka_onayinda(todo: dict) -> bool:
+    return "marka onay" in get_todolist_name(todo)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -131,22 +120,15 @@ def determine_status(todo: dict, last_comment: dict | None) -> tuple[str, str]:
 
 def _parse_excel_bytes(content: bytes) -> list[dict]:
     """
-    Excel içeriğini parse eder.
-    Yapı:
-      - Satır 7: başlık (KİŞİ | Art Check | MARKA | İŞ | TO-DO LINK | ...)
-      - Satır 8+: veriler
-      - Kolon C (index 2): marka
-      - Kolon D (index 3): iş adı
-      - Kolon E (index 4): Basecamp URL (todo ID buradan çıkarılır)
+    Yapı: Satır 7 = başlık, Satır 8+ = veriler
+    Kolon C = marka, D = iş adı, E = Basecamp URL
     Sadece Hopi ve Metro satırlarını döndürür.
     """
     import openpyxl
     wb = openpyxl.load_workbook(io.BytesIO(content), data_only=True)
     ws = wb.active
 
-    tasks = []
-    seen_ids = set()
-
+    tasks, seen = [], set()
     for row in ws.iter_rows(min_row=8, values_only=True):
         task_name = row[3] if len(row) > 3 else None
         brand_raw = row[2] if len(row) > 2 else None
@@ -154,55 +136,38 @@ def _parse_excel_bytes(content: bytes) -> list[dict]:
 
         if not task_name:
             continue
-
         brand = str(brand_raw).strip() if brand_raw else ""
-        # Sadece Hopi ve Metro
         if brand.lower().strip() not in ("hopi", "metro"):
             continue
 
-        # Basecamp todo ID'sini URL'den çıkar
         todo_id = None
         if "/todos/" in bc_url:
             raw_id = bc_url.split("/todos/")[-1].split("#")[0].strip()
             if raw_id.isdigit():
                 todo_id = int(raw_id)
 
-        # Aynı ID'yi iki kez ekleme
         key = todo_id if todo_id else str(task_name).strip().lower()
-        if key in seen_ids:
+        if key in seen:
             continue
-        seen_ids.add(key)
+        seen.add(key)
 
-        tasks.append({
-            "name":    str(task_name).strip(),
-            "brand":   brand,
-            "todo_id": todo_id,
-        })
-
+        tasks.append({"name": str(task_name).strip(), "brand": brand, "todo_id": todo_id})
     return tasks
 
 
 def read_excel_tasks() -> list[dict]:
-    """SharePoint paylaşım linki üzerinden Excel dosyasını oku."""
     sep = "&" if "?" in EXCEL_URL else "?"
     download_url = EXCEL_URL + sep + "download=1"
 
     session = req_lib.Session()
-    session.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-    })
-
-    # İlk istek: SharePoint oturum çerezlerini al
-    r1 = session.get(EXCEL_URL, timeout=30, allow_redirects=True)
-
-    # İkinci istek: download=1 ile dosyayı indir
-    r2 = session.get(download_url, timeout=30, allow_redirects=True)
-    content = r2.content
+    session.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+    session.get(EXCEL_URL, timeout=30, allow_redirects=True)
+    r = session.get(download_url, timeout=30, allow_redirects=True)
+    content = r.content
 
     if content[:2] != b"PK":
-        # İlk 200 karakteri logla (debug için)
         preview = content[:200].decode("utf-8", errors="replace")
-        raise ValueError(f"xlsx değil, HTML/text geldi. Önizleme: {preview[:100]}")
+        raise ValueError(f"xlsx değil, HTML/text geldi: {preview[:120]}")
 
     return _parse_excel_bytes(content)
 
@@ -211,52 +176,38 @@ def read_excel_tasks() -> list[dict]:
 #  RAPOR OLUŞTURMA
 # ══════════════════════════════════════════════════════════════════════════
 
-def format_list(items: list, with_commenter: bool = False) -> list[str]:
-    if not items:
-        return ["  (Yok)"]
-    lines = []
-    for t in items:
-        line = f"  - {t['name']} — {t.get('brand', '')}"
-        if with_commenter and t.get("commenter"):
-            line += f" (Son yorum: {t['commenter']})"
-        lines.append(line)
-    return lines
-
-
 def build_report(
-    categorized: dict,
+    yesile_boya: list,
+    aktif: list,
     sil_listesi: list,
     ekle_listesi: list,
     today: str,
     excel_error: str = "",
 ) -> str:
+    def fmt(items):
+        if not items:
+            return ["  (Yok)"]
+        return [f"  - {t['name']} — {t.get('brand','')}" for t in items]
+
     lines = [f"📋 EXCEL GÜNCELLEME TALİMATLARI — {today}", ""]
 
     if excel_error:
         lines += [f"⚠️  Excel okunamadı: {excel_error}", ""]
 
-    lines.append("🗑️ SİL (Basecamp'te tamamlandı / artık atanmamış):")
-    lines += format_list(sil_listesi)
+    lines.append("🗑️  SİL (Basecamp'te tamamlandı / artık listede yok):")
+    lines += fmt(sil_listesi)
     lines.append("")
 
     lines.append("🟢 YEŞİLE BOYA (Marka Onayında listesinde):")
-    lines += format_list(categorized["MARKA_ONAYINDA"])
+    lines += fmt(yesile_boya)
     lines.append("")
 
-    lines.append("🎨 TASARIMDA olarak işaretle:")
-    lines += format_list(categorized["TASARIMDA"], with_commenter=True)
+    lines.append("📋 AKTİF — renksiz bırak (Tasarım / SM&PM ekibinde):")
+    lines += fmt(aktif)
     lines.append("")
 
-    lines.append("✅ ONAYDA olarak işaretle:")
-    lines += format_list(categorized["ONAYDA"], with_commenter=True)
-    lines.append("")
-
-    lines.append("➕ EXCEL'E EKLE (Basecamp'te aktif, Excel'de yok):")
-    lines += format_list(ekle_listesi)
-    lines.append("")
-
-    lines.append("❓ BELİRSİZ (durumu sen kontrol et):")
-    lines += format_list(categorized["BELIRSIZ"])
+    lines.append("➕ EXCEL'E EKLE (Basecamp'te var, Excel'de yok):")
+    lines += fmt(ekle_listesi)
 
     return "\n".join(lines)
 
@@ -266,7 +217,6 @@ def build_report(
 # ══════════════════════════════════════════════════════════════════════════
 
 def send_email(subject: str, body: str) -> None:
-    """Mail gönder. Railway SMTP bloke ediyorsa hata fırlatır (non-fatal)."""
     msg = MIMEText(body, "plain", "utf-8")
     msg["From"]    = GMAIL_USER
     msg["To"]      = RECIPIENT_EMAIL
@@ -283,28 +233,21 @@ def send_email(subject: str, body: str) -> None:
 # ══════════════════════════════════════════════════════════════════════════
 
 def run_report(trigger: str = "cron") -> str:
-    """
-    Raporu çalıştır ve döndür.
-    trigger: 'cron' | 'webhook' | 'manual'
-    """
     if not _report_lock.acquire(blocking=False):
-        print("⏳ Rapor zaten çalışıyor, bu istek atlandı.")
         return "SKIPPED: rapor zaten çalışıyor"
 
     try:
         today = datetime.now().strftime("%d.%m.%Y %H:%M")
         print(f"\n▶  Rapor başlatıldı [{trigger}]: {today}\n{'─'*50}")
 
-        # 1. Basecamp access token
         token = get_access_token()
-        print("✅ Basecamp token alındı")
+        print("✅ Token alındı")
 
-        # 2. Her iki hesaptan aktif görevleri çek
+        # Aktif todo'ları çek
         all_todos = []
         for acct_id in BASECAMP_ACCOUNT_IDS:
             try:
                 raw = bc_get(token, acct_id, "my/assignments.json")
-                # API {"priorities": [...], "non_priorities": [...]} döndürür
                 fetched = []
                 for item in raw:
                     if isinstance(item, dict) and "priorities" in item:
@@ -317,59 +260,51 @@ def run_report(trigger: str = "cron") -> str:
                     t["_account_id"] = acct_id
                 all_todos.extend(fetched)
             except Exception as e:
-                print(f"⚠️  Hesap {acct_id} okunamadı: {e}")
+                print(f"⚠️  Hesap {acct_id}: {e}")
 
-        # 3. Sadece "Metro - Dijital" ve "Hopi - Sosyal Medya" projeleri
+        # Sadece hedef projeler, sadece aktif (completed=False)
         todos = []
         for t in all_todos:
             project_name = (t.get("bucket") or {}).get("name", "").lower().strip()
             if project_name in TARGET_PROJECTS and not t.get("completed", False):
                 todos.append(t)
 
-        print(f"🎯 Hedef projelerdeki aktif görev sayısı: {len(todos)}")
+        print(f"🎯 Hedef projelerde aktif görev: {len(todos)}")
 
-        # 4. Her görev için durum belirle
-        categorized: dict[str, list] = {
-            "MARKA_ONAYINDA": [],
-            "TASARIMDA":      [],
-            "ONAYDA":         [],
-            "BELIRSIZ":       [],
-        }
-
+        # Durum kategorileri
+        yesile_boya, aktif = [], []
         for todo in todos:
-            bucket_id    = (todo.get("bucket") or {}).get("id")
-            recording_id = todo.get("id")
-            project_raw  = (todo.get("bucket") or {}).get("name", "")
-            brand        = TARGET_PROJECTS.get(project_raw.lower().strip(), project_raw)
-            acct_id      = todo.get("_account_id", BASECAMP_ACCOUNT_IDS[0])
+            # Prodüksiyon işleri → rapora dahil etme
+            if is_produksiyon(todo):
+                continue
 
-            last_comment = get_last_comment(token, acct_id, bucket_id, recording_id)
-            status, commenter = determine_status(todo, last_comment)
+            project_raw = (todo.get("bucket") or {}).get("name", "")
+            brand = TARGET_PROJECTS.get(project_raw.lower().strip(), project_raw)
+            name  = get_todo_title(todo)
+            item  = {"name": name, "brand": brand, "id": todo.get("id")}
 
-            categorized[status].append({
-                "name":      todo.get("title") or todo.get("content") or todo.get("summary") or "",
-                "brand":     brand,
-                "commenter": commenter,
-            })
-            print(f"   [{status}] {todo.get('title','')} ({brand})")
+            if is_marka_onayinda(todo):
+                yesile_boya.append(item)
+                print(f"  🟢 [MARKA ONAYINDA] {name}")
+            else:
+                aktif.append(item)
+                print(f"  📋 [AKTİF] {name} ({get_todolist_name(todo)})")
 
-        # 5. Excel'i oku
+        # Excel oku
         excel_error = ""
         excel_tasks = []
         try:
             excel_tasks = read_excel_tasks()
-            print(f"\n📊 Excel'de {len(excel_tasks)} iş bulundu")
+            print(f"\n📊 Excel: {len(excel_tasks)} iş")
         except Exception as e:
             excel_error = str(e)
-            print(f"\n⚠️  Excel okunamadı: {e}")
+            print(f"⚠️  Excel: {e}")
 
-        # ID bazlı eşleştirme (kolon E'den todo ID varsa) + isim fallback
-        active_bc_ids   = {t.get("id") for t in todos if t.get("id")}
-        active_bc_names = {
-            (todo.get("title") or todo.get("content") or todo.get("summary") or "").lower().strip()
-            for todo in todos
-        }
+        # Aktif Basecamp ID ve isimlerini topla
+        active_bc_ids   = {t["id"] for t in todos if t.get("id")}
+        active_bc_names = {get_todo_title(t).lower() for t in todos}
 
+        # Excel'de var ama Basecamp'te aktif değil → SİL
         sil_listesi = []
         for t in excel_tasks:
             tid = t.get("todo_id")
@@ -378,32 +313,30 @@ def run_report(trigger: str = "cron") -> str:
             if not matched:
                 sil_listesi.append(t)
 
+        # Basecamp'te var ama Excel'de yok → EKLE
         excel_ids   = {t["todo_id"] for t in excel_tasks if t.get("todo_id")}
         excel_names = {t["name"].lower().strip() for t in excel_tasks}
         ekle_listesi = []
         for todo in todos:
+            if is_produksiyon(todo):
+                continue
             tid  = todo.get("id")
-            name = (todo.get("title") or todo.get("content") or todo.get("summary") or "").strip()
-            in_excel = (tid and tid in excel_ids) or (name.lower() in excel_names)
-            if not in_excel:
+            name = get_todo_title(todo)
+            if not ((tid and tid in excel_ids) or (name.lower() in excel_names)):
                 project_raw = (todo.get("bucket") or {}).get("name", "")
-                brand       = TARGET_PROJECTS.get(project_raw.lower().strip(), project_raw)
+                brand = TARGET_PROJECTS.get(project_raw.lower().strip(), project_raw)
                 ekle_listesi.append({"name": name, "brand": brand})
 
-        # 6. Raporu oluştur
-        report = build_report(categorized, sil_listesi, ekle_listesi, today, excel_error)
+        report = build_report(yesile_boya, aktif, sil_listesi, ekle_listesi, today, excel_error)
         print(f"\n{'═'*50}\n{report}\n{'═'*50}")
 
-        # 7. Mail gönder (hata olursa raporu bozmaz)
         if GMAIL_USER and GMAIL_PASSWORD:
             try:
                 send_email(f"📋 Excel Güncelleme Talimatları — {today}", report)
                 print("✉️  Mail gönderildi!")
-            except Exception as mail_err:
-                print(f"⚠️  Mail gönderilemedi: {mail_err}")
-                report += f"\n\n⚠️ Mail gönderilemedi: {mail_err}"
-        else:
-            print("ℹ️  Mail bilgileri eksik, atlandı.")
+            except Exception as e:
+                print(f"⚠️  Mail: {e}")
+                report += f"\n\n⚠️ Mail gönderilemedi: {e}"
 
         return report
 
@@ -415,9 +348,30 @@ def run_report(trigger: str = "cron") -> str:
 #  FLASK ENDPOINT'LERİ
 # ══════════════════════════════════════════════════════════════════════════
 
+@app.route("/health")
+def health():
+    return jsonify({"status": "ok", "time": datetime.now().isoformat()})
+
+
+@app.route("/run")
+def manual_run():
+    report = run_report(trigger="manual")
+    return f"<pre>{report}</pre>", 200
+
+
+@app.route("/webhook", methods=["POST"])
+def basecamp_webhook():
+    payload = request.get_json(silent=True) or {}
+    kind    = payload.get("kind", "unknown")
+    print(f"🔔 Webhook: {kind}")
+    t = threading.Thread(target=run_report, kwargs={"trigger": f"webhook:{kind}"})
+    t.daemon = True
+    t.start()
+    return jsonify({"status": "accepted"}), 202
+
+
 @app.route("/debug")
 def debug():
-    """Tüm atanmış görevleri ve bucket isimlerini gösterir."""
     try:
         token = get_access_token()
     except Exception as e:
@@ -432,84 +386,49 @@ def debug():
                 if isinstance(item, dict) and "priorities" in item:
                     todos.extend(item.get("priorities", []))
                     todos.extend(item.get("non_priorities", []))
-                elif isinstance(item, dict) and item.get("title"):
-                    todos.append(item)
             lines.append(f"\n=== Hesap {acct_id} ({len(todos)} görev) ===")
             for t in todos:
-                bucket_name = (t.get("bucket") or {}).get("name", "YOK")
-                bucket_lower = bucket_name.lower().strip()
-                match = "✅" if bucket_lower in TARGET_PROJECTS else "❌"
-                # title yoksa content, summary, name dene
-                title = t.get("title") or t.get("content") or t.get("summary") or t.get("name") or "???"
-                lines.append(f"{match} [{repr(bucket_lower)}] {title}")
+                bucket = (t.get("bucket") or {}).get("name", "YOK")
+                lst    = get_todolist_name(t)
+                match  = "✅" if bucket.lower().strip() in TARGET_PROJECTS else "❌"
+                lines.append(f"{match} [{bucket}] [{lst}] {get_todo_title(t)}")
         except Exception as e:
-            lines.append(f"Hesap {acct_id} hata: {e}")
+            lines.append(f"Hata: {e}")
 
-    lines.append(f"\nHEDEF PROJELER: {list(TARGET_PROJECTS.keys())}")
     return f"<pre>{chr(10).join(lines)}</pre>", 200
-
-
-@app.route("/health")
-def health():
-    return jsonify({"status": "ok", "time": datetime.now().isoformat()})
-
-
-@app.route("/run")
-def manual_run():
-    """Manuel tetikleme."""
-    report = run_report(trigger="manual")
-    return f"<pre>{report}</pre>", 200
 
 
 @app.route("/setup-webhooks")
 def setup_webhooks():
-    """
-    Basecamp'teki 'Metro - Dijital' ve 'Hopi - Sosyal Medya' projelerini bulur,
-    her birine bu sunucuyu işaret eden webhook kaydeder.
-    Tarayıcıdan bir kez çağır — otomatik halleder.
-    """
-    import socket
     railway_url = f"https://{request.host}/webhook"
     results = []
-
     try:
         token = get_access_token()
     except Exception as e:
-        return f"<pre>❌ Token alınamadı: {e}</pre>", 500
+        return f"<pre>Token hatası: {e}</pre>", 500
 
     for acct_id in BASECAMP_ACCOUNT_IDS:
         try:
             projects = bc_get(token, acct_id, "projects.json")
         except Exception as e:
-            results.append(f"❌ Hesap {acct_id} proje listesi alınamadı: {e}")
+            results.append(f"❌ Hesap {acct_id}: {e}")
             continue
 
         for proj in projects:
             name = proj.get("name", "").lower().strip()
             if name not in TARGET_PROJECTS:
                 continue
-
-            proj_id = proj["id"]
+            proj_id   = proj["id"]
             proj_name = proj["name"]
-
-            # Mevcut webhook'ları kontrol et
             try:
                 existing = bc_get(token, acct_id, f"buckets/{proj_id}/webhooks.json")
-                already = any(
-                    w.get("payload_url") == railway_url
-                    for w in existing
-                )
-                if already:
-                    results.append(f"✅ {proj_name} — webhook zaten kayıtlı")
+                if any(w.get("payload_url") == railway_url for w in existing):
+                    results.append(f"✅ {proj_name} — zaten kayıtlı")
                     continue
             except Exception:
                 pass
 
-            # Webhook kaydet — types belirtilmezse tüm olayları dinler
-            payload = json.dumps({
-                "payload_url": railway_url,
-            }).encode()
-
+            payload = json.dumps({"payload_url": railway_url}).encode()
             headers = {
                 "Authorization": f"Bearer {token}",
                 "Content-Type":  "application/json",
@@ -517,68 +436,37 @@ def setup_webhooks():
             }
             req = urllib.request.Request(
                 f"https://3.basecampapi.com/{acct_id}/buckets/{proj_id}/webhooks.json",
-                data=payload,
-                headers=headers,
-                method="POST",
+                data=payload, headers=headers, method="POST",
             )
             try:
                 with urllib.request.urlopen(req, timeout=30) as r:
                     resp = json.loads(r.read())
-                    results.append(f"✅ {proj_name} — webhook kaydedildi (ID: {resp.get('id')})")
+                    results.append(f"✅ {proj_name} — kaydedildi (ID: {resp.get('id')})")
             except Exception as e:
-                results.append(f"❌ {proj_name} — webhook kaydedilemedi: {e}")
+                results.append(f"❌ {proj_name}: {e}")
 
-    body = "\n".join(results) if results else "Hiç hedef proje bulunamadı!"
-    return f"<pre>{body}\n\nWebhook URL: {railway_url}</pre>", 200
-
-
-@app.route("/webhook", methods=["POST"])
-def basecamp_webhook():
-    """
-    Basecamp bu endpoint'e POST gönderir.
-    İçerik doğrulanmaz — gelen her POST raporu tetikler.
-    """
-    payload = request.get_json(silent=True) or {}
-    kind    = payload.get("kind", "unknown")
-    print(f"🔔 Webhook alındı: {kind}")
-
-    # Arka planda çalıştır — Basecamp 10sn timeout'u var
-    t = threading.Thread(target=run_report, kwargs={"trigger": f"webhook:{kind}"})
-    t.daemon = True
-    t.start()
-
-    return jsonify({"status": "accepted", "kind": kind}), 202
+    return f"<pre>{chr(10).join(results)}\n\nWebhook URL: {railway_url}</pre>", 200
 
 
 # ══════════════════════════════════════════════════════════════════════════
-#  SCHEDULER (18:00 Türkiye = 15:00 UTC yaz / 16:00 UTC kış)
+#  SCHEDULER
 # ══════════════════════════════════════════════════════════════════════════
 
 def start_scheduler():
     scheduler = BackgroundScheduler(timezone="Europe/Istanbul")
-    # Haftaiçi (Mon-Fri) her gün 18:00 Türkiye saatinde
     scheduler.add_job(
         func=run_report,
-        trigger=CronTrigger(
-            day_of_week="mon-fri",
-            hour=18,
-            minute=0,
-            timezone="Europe/Istanbul",
-        ),
+        trigger=CronTrigger(day_of_week="mon-fri", hour=18, minute=0, timezone="Europe/Istanbul"),
         kwargs={"trigger": "cron"},
         id="daily_report",
         replace_existing=True,
     )
     scheduler.start()
-    print("📅 Scheduler başlatıldı — Haftaiçi 18:00 (Türkiye)")
+    print("📅 Scheduler: Haftaiçi 18:00 TK")
 
-
-# ══════════════════════════════════════════════════════════════════════════
-#  BAŞLANGIÇ
-# ══════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
     start_scheduler()
     port = int(os.environ.get("PORT", 8080))
-    print(f"🚀 Sunucu başlatıldı — port {port}")
+    print(f"🚀 Port {port}")
     app.run(host="0.0.0.0", port=port, debug=False)
