@@ -95,22 +95,26 @@ def bc_get(token: str, account_id: str, path: str) -> list:
     return results
 
 
-def check_todo_completed(token: str, account_id: str, bucket_id, todo_id) -> bool | None:
+def get_todo_info(token: str, account_id: str, bucket_id, todo_id) -> dict | None:
     """
-    Belirtilen todo'nun tamamlanıp tamamlanmadığını doğrudan API'den kontrol eder.
-    Döner: True = tamamlandı, False = aktif, None = bulunamadı / hata
+    Belirtilen todo hakkında bilgi getirir.
+    Döner: {"completed": bool, "list_name": str, "produksiyon": bool}
+           veya None (bulunamadı / hata)
     """
     try:
         items = bc_get(token, account_id, f"buckets/{bucket_id}/todos/{todo_id}.json")
         if items:
             todo = items[0]
-            return bool(todo.get("completed", False))
+            return {
+                "completed":  bool(todo.get("completed", False)),
+                "list_name":  get_todolist_name(todo),
+                "produksiyon": any(k in get_todolist_name(todo) for k in PRODUKSIYON_LIST_KEYWORDS),
+            }
         return None
     except Exception as e:
-        err_str = str(e)
-        if "404" in err_str:
-            return None   # silinmiş / bulunamadı
-        print(f"⚠️  check_todo_completed({account_id}/{bucket_id}/{todo_id}): {e}")
+        if "404" in str(e):
+            return None
+        print(f"⚠️  get_todo_info({account_id}/{bucket_id}/{todo_id}): {e}")
         return None
 
 
@@ -213,6 +217,80 @@ def read_excel_tasks() -> list[dict]:
 #  RAPOR OLUŞTURMA
 # ══════════════════════════════════════════════════════════════════════════
 
+# ══════════════════════════════════════════════════════════════════════════
+#  GEÇMİŞ TAKİBİ
+# ══════════════════════════════════════════════════════════════════════════
+
+STATE_FILE = "/tmp/bc_state.json"
+
+
+def load_state() -> dict:
+    try:
+        with open(STATE_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_state(sil: list, yesile: list, aktif: list, ekle: list, timestamp: str):
+    state = {
+        "timestamp": timestamp,
+        "sil":    [t["name"] for t in sil],
+        "yesile": [t["name"] for t in yesile],
+        "aktif":  [t["name"] for t in aktif],
+        "ekle":   [t["name"] for t in ekle],
+    }
+    try:
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"⚠️  State kayıt hatası: {e}")
+
+
+def compute_changes(prev: dict, sil: list, yesile: list, aktif: list, ekle: list) -> list[str]:
+    """Önceki rapor ile karşılaştırarak değişiklikleri döndürür."""
+    if not prev:
+        return []
+    changes = []
+
+    curr_sil    = {t["name"] for t in sil}
+    curr_yesile = {t["name"] for t in yesile}
+    curr_aktif  = {t["name"] for t in aktif}
+    curr_ekle   = {t["name"] for t in ekle}
+
+    prev_sil    = set(prev.get("sil", []))
+    prev_yesile = set(prev.get("yesile", []))
+    prev_aktif  = set(prev.get("aktif", []))
+    prev_ekle   = set(prev.get("ekle", []))
+
+    # Yeni tamamlananlar (yeni SİL'e girenler)
+    yeni_sil = curr_sil - prev_sil
+    if yeni_sil:
+        changes.append("Yeni tamamlandı: " + ", ".join(sorted(yeni_sil)))
+
+    # Excel'den silindi (önceki SİL'de artık yok)
+    silindi = prev_sil - curr_sil
+    if silindi:
+        changes.append("Excel'den silindi: " + ", ".join(sorted(silindi)))
+
+    # Marka onayına yeni gelenler
+    yeni_onay = curr_yesile - prev_yesile
+    if yeni_onay:
+        changes.append("Marka onayına geldi: " + ", ".join(sorted(yeni_onay)))
+
+    # Onaydan çıkanlar
+    onaydan_cikti = prev_yesile - curr_yesile
+    if onaydan_cikti:
+        changes.append("Onaydan çıktı: " + ", ".join(sorted(onaydan_cikti)))
+
+    # Yeni eklenen Basecamp işleri
+    yeni_bc = curr_ekle - prev_ekle
+    if yeni_bc:
+        changes.append("Basecamp'te yeni iş: " + ", ".join(sorted(yeni_bc)))
+
+    return changes
+
+
 def build_report(
     yesile_boya: list,
     aktif: list,
@@ -220,16 +298,28 @@ def build_report(
     ekle_listesi: list,
     today: str,
     excel_error: str = "",
+    changes: list = None,
 ) -> str:
     def fmt(items):
         if not items:
             return ["  (Yok)"]
-        return [f"  - {t['name']} — {t.get('brand','')}" for t in items]
+        lines = []
+        for t in items:
+            note = " 🟢 (yeşile boya)" if t.get("yesile_boya") else ""
+            lines.append(f"  - {t['name']} — {t.get('brand','')}{note}")
+        return lines
 
     lines = [f"📋 EXCEL GÜNCELLEME TALİMATLARI — {today}", ""]
 
     if excel_error:
         lines += [f"⚠️  Excel okunamadı: {excel_error}", ""]
+
+    # Değişiklikler özeti
+    if changes:
+        lines.append("🔄 SON RAPORDAN DEĞİŞİKLİKLER:")
+        for c in changes:
+            lines.append(f"  • {c}")
+        lines.append("")
 
     lines.append("🗑️  SİL (Basecamp'te tamamlandı / artık listede yok):")
     lines += fmt(sil_listesi)
@@ -359,36 +449,36 @@ def run_report(trigger: str = "cron") -> str:
         active_bc_ids   = {t["id"] for t in todos if t.get("id")}
         active_bc_names = {get_todo_title(t).lower() for t in todos}
 
-        # Excel'de var ama Basecamp'te aktif değil → SİL
-        # Ama önce: my/assignments.json sadece Ertuğ'a atanmış işleri döndürür.
-        # Dilara/Derin'e atanan aktif işler orada görünmez → yanlış SİL'e düşer.
-        # Çözüm: eşleşmeyen Excel item'ları için doğrudan Basecamp API'sine soruyoruz.
+        # Excel'de var ama Basecamp'te aktif değil → SİL / kategorize et
+        # my/assignments.json sadece Ertuğ'a atananları döndürür.
+        # Başka kişilere atananlar için doğrudan API'ye sorulur + durum belirlenir.
         sil_listesi = []
         for t in excel_tasks:
             tid = t.get("todo_id")
             matched = (tid and tid in active_bc_ids) or \
                       (t["name"].lower().strip() in active_bc_names)
             if matched:
-                continue  # Ertuğ'un listesinde var, aktif → SİL değil
+                continue  # Ertuğ'un listesinde var → zaten yesile/aktif'te
 
-            # Ertuğ'un listesinde yok — doğrudan API'ye sor
             bucket_id = t.get("bucket_id")
             url_acct  = t.get("url_account_id")
             if tid and bucket_id and url_acct:
-                completed = check_todo_completed(token, url_acct, bucket_id, tid)
-                if completed is True:
-                    # Basecamp'te gerçekten tamamlanmış → SİL
-                    sil_listesi.append(t)
-                    print(f"  🗑️  [SİL - tamamlandı] {t['name']}")
-                elif completed is False:
-                    # Aktif ama başka birine atanmış → SİL değil
-                    print(f"  ⏭️  [AKTİF - başka kişi] {t['name']}")
-                else:
-                    # 404 veya bulunamadı → silinmiş/arşivlenmiş → SİL
+                info = get_todo_info(token, url_acct, bucket_id, tid)
+                if info is None:
                     sil_listesi.append(t)
                     print(f"  🗑️  [SİL - bulunamadı] {t['name']}")
+                elif info["completed"]:
+                    sil_listesi.append(t)
+                    print(f"  🗑️  [SİL - tamamlandı] {t['name']}")
+                elif info["produksiyon"]:
+                    print(f"  ⏭️  [SKIP - prodüksiyon aktif] {t['name']}")
+                elif "marka onay" in info["list_name"]:
+                    yesile_boya.append({**t, "id": tid})
+                    print(f"  🟢 [MARKA ONAYINDA - başka kişi] {t['name']}")
+                else:
+                    aktif.append({**t, "id": tid})
+                    print(f"  📋 [AKTİF - başka kişi] {t['name']} ({info['list_name']})")
             else:
-                # URL bilgisi yok → isim eşleşmesi yok → SİL
                 sil_listesi.append(t)
                 print(f"  🗑️  [SİL - URL yok] {t['name']}")
 
@@ -404,9 +494,34 @@ def run_report(trigger: str = "cron") -> str:
             if not ((tid and tid in excel_ids) or (name.lower() in excel_names)):
                 project_raw = (todo.get("bucket") or {}).get("name", "")
                 brand = TARGET_PROJECTS.get(project_raw.lower().strip(), project_raw)
-                ekle_listesi.append({"name": name, "brand": brand})
+                # Marka Onayında ise EKLE'de yeşil notu ekle
+                ekle_listesi.append({
+                    "name": name,
+                    "brand": brand,
+                    "yesile_boya": is_marka_onayinda(todo),
+                })
 
-        report = build_report(yesile_boya, aktif, sil_listesi, ekle_listesi, today, excel_error)
+        # EKLE'de olan işleri YEŞİLE BOYA listesinden çıkar (çakışma önleme)
+        # (Zaten Excel'de olmadığı için "yeşile boya" değil "ekle + yeşile boya" yapılacak)
+        ekle_names = {t["name"].lower() for t in ekle_listesi}
+        ekle_ids   = {t.get("todo_id") for t in ekle_listesi if t.get("todo_id")}
+        yesile_boya = [
+            y for y in yesile_boya
+            if not (y["name"].lower() in ekle_names or
+                    (y.get("id") and y.get("id") in ekle_ids))
+        ]
+        aktif = [
+            a for a in aktif
+            if not (a["name"].lower() in ekle_names or
+                    (a.get("id") and a.get("id") in ekle_ids))
+        ]
+
+        # Geçmiş durum yükle → değişiklikleri hesapla
+        prev_state = load_state()
+        changes = compute_changes(prev_state, sil_listesi, yesile_boya, aktif, ekle_listesi)
+        save_state(sil_listesi, yesile_boya, aktif, ekle_listesi, today)
+
+        report = build_report(yesile_boya, aktif, sil_listesi, ekle_listesi, today, excel_error, changes)
         print(f"\n{'═'*50}\n{report}\n{'═'*50}")
 
         if BREVO_API_KEY:
