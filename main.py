@@ -367,11 +367,79 @@ def build_report(
 
 
 # ══════════════════════════════════════════════════════════════════════════
-#  EMAİL
+#  HTML MAİL
 # ══════════════════════════════════════════════════════════════════════════
 
-def send_email(subject: str, body: str) -> None:
-    """Brevo (Sendinblue) HTTP API ile mail gönderir."""
+def build_html_report(
+    yesile_boya: list,
+    renksiz_yap: list,
+    sil_listesi: list,
+    ekle_listesi: list,
+    today: str,
+    excel_error: str = "",
+    changes: list = None,
+) -> str:
+    def card(title: str, color: str, icon: str, items: list, note_key: str = "yesile_boya") -> str:
+        border  = f"border-left: 5px solid {color};"
+        header_bg = color
+        if not items:
+            rows = "<li style='color:#888;font-style:italic;'>Yok</li>"
+        else:
+            rows = ""
+            for t in items:
+                note = " &nbsp;<span style='background:#00b050;color:#fff;padding:1px 6px;border-radius:3px;font-size:11px;'>yeşile boya</span>" if t.get(note_key) else ""
+                rows += f"<li style='padding:4px 0;border-bottom:1px solid #f0f0f0;'><b>{t['name']}</b> <span style='color:#888;font-size:12px;'>— {t.get('brand','')}</span>{note}</li>"
+        return f"""
+        <div style='margin:12px 0;border-radius:8px;overflow:hidden;box-shadow:0 1px 4px rgba(0,0,0,0.08);{border}background:#fff;'>
+          <div style='background:{header_bg};color:#fff;padding:10px 16px;font-weight:bold;font-size:14px;letter-spacing:.3px;'>
+            {icon} &nbsp;{title}
+          </div>
+          <ul style='margin:0;padding:12px 16px 12px 32px;list-style:disc;'>
+            {rows}
+          </ul>
+        </div>"""
+
+    changes_block = ""
+    if changes:
+        items_html = "".join(f"<li>{c}</li>" for c in changes)
+        changes_block = f"""
+        <div style='margin:12px 0;border-radius:8px;background:#fff8e1;border:1px solid #ffe082;padding:12px 16px;'>
+          <div style='font-weight:bold;color:#f57c00;margin-bottom:6px;'>🔄 Son Rapordan Değişiklikler</div>
+          <ul style='margin:0;padding-left:20px;color:#555;'>{items_html}</ul>
+        </div>"""
+
+    error_block = ""
+    if excel_error:
+        error_block = f"<div style='background:#fff3f3;border:1px solid #ffcdd2;border-radius:8px;padding:10px 16px;margin:12px 0;color:#c62828;'>⚠️ Excel okunamadı: {excel_error}</div>"
+
+    html = f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"></head>
+<body style='font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,sans-serif;background:#f5f5f5;margin:0;padding:20px;'>
+  <div style='max-width:600px;margin:0 auto;'>
+
+    <div style='background:linear-gradient(135deg,#1a1a2e,#16213e);color:#fff;border-radius:10px;padding:20px 24px;margin-bottom:16px;'>
+      <div style='font-size:11px;text-transform:uppercase;letter-spacing:1px;opacity:.7;margin-bottom:4px;'>PunchBBDO — Excel Takip</div>
+      <div style='font-size:22px;font-weight:bold;'>📋 Güncelleme Talimatları</div>
+      <div style='font-size:13px;opacity:.8;margin-top:4px;'>{today}</div>
+    </div>
+
+    {error_block}
+    {changes_block}
+    {card("SİL — Basecamp'te tamamlandı", "#e53935", "🗑️", sil_listesi)}
+    {card("YEŞİLE BOYA — Marka Onayında, Excel'de henüz yeşil değil", "#00b050", "🟢", yesile_boya)}
+    {card("RENKSİZ YAP — Artık Marka Onayında değil, Excel'de hâlâ yeşil", "#757575", "⬜", renksiz_yap)}
+    {card("EXCEL'E EKLE — Basecamp'te var, Excel'de yok", "#1976d2", "➕", ekle_listesi)}
+
+    <div style='text-align:center;font-size:11px;color:#aaa;margin-top:20px;'>
+      Otomatik rapor · bc-takip-production.up.railway.app
+    </div>
+  </div>
+</body></html>"""
+    return html
+
+
+def send_email(subject: str, body_text: str, body_html: str) -> None:
+    """Brevo (Sendinblue) HTTP API ile HTML mail gönderir."""
     if not BREVO_API_KEY:
         raise ValueError("BREVO_API_KEY env değişkeni ayarlanmamış")
 
@@ -379,7 +447,8 @@ def send_email(subject: str, body: str) -> None:
         "sender":      {"name": "Excel Rapor", "email": RECIPIENT_EMAIL},
         "to":          [{"email": RECIPIENT_EMAIL}],
         "subject":     subject,
-        "textContent": body,
+        "textContent": body_text,
+        "htmlContent": body_html,
     }).encode("utf-8")
 
     req = urllib.request.Request(
@@ -541,12 +610,13 @@ def run_report(trigger: str = "cron") -> str:
         changes = compute_changes(prev_state, sil_listesi, yesile_boya, renksiz_yap, ekle_listesi)
         save_state(sil_listesi, yesile_boya, renksiz_yap, ekle_listesi, today)
 
-        report = build_report(yesile_boya, renksiz_yap, sil_listesi, ekle_listesi, today, excel_error, changes)
+        report      = build_report(yesile_boya, renksiz_yap, sil_listesi, ekle_listesi, today, excel_error, changes)
+        report_html = build_html_report(yesile_boya, renksiz_yap, sil_listesi, ekle_listesi, today, excel_error, changes)
         print(f"\n{'═'*50}\n{report}\n{'═'*50}")
 
         if BREVO_API_KEY:
             try:
-                send_email(f"📋 Excel Güncelleme Talimatları — {today}", report)
+                send_email(f"📋 Excel Güncelleme Talimatları — {today}", report, report_html)
                 print("✉️  Mail gönderildi!")
             except Exception as e:
                 print(f"⚠️  Mail: {e}")
