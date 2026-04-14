@@ -573,11 +573,24 @@ def manual_run():
     return f"<pre>{report}</pre>", 200
 
 
+WEBHOOK_TRIGGER_KINDS = {
+    "todo_completed",          # tamamlandı
+    "todo_uncompleted",        # tamamlanmadı olarak geri alındı
+    "todo_created",            # yeni iş oluşturuldu (liste değişimi de bunu tetikler)
+    "todo_assignment_changed", # atanan kişi değişti
+    "todo_trashed",            # silindi / arşivlendi
+}
+
 @app.route("/webhook", methods=["POST"])
 def basecamp_webhook():
     payload = request.get_json(silent=True) or {}
     kind    = payload.get("kind", "unknown")
-    print(f"🔔 Webhook: {kind}")
+
+    if kind not in WEBHOOK_TRIGGER_KINDS:
+        print(f"⏭️  Webhook atlandı [{kind}]")
+        return jsonify({"status": "ignored", "kind": kind}), 200
+
+    print(f"🔔 Webhook tetiklendi [{kind}]")
     t = threading.Thread(target=run_report, kwargs={"trigger": f"webhook:{kind}"})
     t.daemon = True
     t.start()
