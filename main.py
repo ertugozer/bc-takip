@@ -47,6 +47,9 @@ TARGET_PROJECTS = {
 # Prodüksiyon listesi — aktifse rapora dahil etme, completedsa SİL
 PRODUKSIYON_LIST_KEYWORDS = ["prodüksiyon", "produksiyon", "production"]
 
+# SM & PM listesi — aktifse tamamen yoksay (ne yeşile boya ne renksiz yap)
+SM_PM_LIST_KEYWORDS = ["sm & pm", "sm&pm", "sm ve pm"]
+
 # Webhook lock
 _report_lock = threading.Lock()
 
@@ -105,10 +108,11 @@ def get_todo_info(token: str, account_id: str, bucket_id, todo_id) -> dict | Non
         items = bc_get(token, account_id, f"buckets/{bucket_id}/todos/{todo_id}.json")
         if items:
             todo = items[0]
+            ln = get_todolist_name(todo)
             return {
-                "completed":  bool(todo.get("completed", False)),
-                "list_name":  get_todolist_name(todo),
-                "produksiyon": any(k in get_todolist_name(todo) for k in PRODUKSIYON_LIST_KEYWORDS),
+                "completed":   bool(todo.get("completed", False)),
+                "list_name":   ln,
+                "produksiyon": any(k in ln for k in PRODUKSIYON_LIST_KEYWORDS),
             }
         return None
     except Exception as e:
@@ -129,6 +133,11 @@ def get_todolist_name(todo: dict) -> str:
 def is_produksiyon(todo: dict) -> bool:
     name = get_todolist_name(todo)
     return any(k in name for k in PRODUKSIYON_LIST_KEYWORDS)
+
+
+def is_sm_pm(todo: dict) -> bool:
+    name = get_todolist_name(todo)
+    return any(k in name for k in SM_PM_LIST_KEYWORDS)
 
 
 def is_marka_onayinda(todo: dict) -> bool:
@@ -154,7 +163,7 @@ def _is_green_cell(cell) -> bool:
         r = int(rgb[2:4], 16)
         g = int(rgb[4:6], 16)
         b = int(rgb[6:8], 16)
-        return g > 150 and g > r * 0.9 and g > b
+        return g > 150 and g > r * 1.2 and g > b
     except Exception:
         return False
 
@@ -535,7 +544,7 @@ def run_report(trigger: str = "cron") -> str:
 
         # ── PASS 1: Ertuğ'a atanmış Basecamp todoları ──────────────────────
         for todo in todos:
-            if is_produksiyon(todo):
+            if is_produksiyon(todo) or is_sm_pm(todo):
                 continue
 
             tid   = todo.get("id")
@@ -588,6 +597,8 @@ def run_report(trigger: str = "cron") -> str:
                     print(f"  🗑️  [SİL - tamamlandı] {t['name']}")
                 elif info["produksiyon"]:
                     print(f"  ⏭️  [SKIP - prodüksiyon] {t['name']}")
+                elif any(k in info["list_name"] for k in SM_PM_LIST_KEYWORDS):
+                    print(f"  ⏭️  [SKIP - sm&pm] {t['name']}")
                 elif "marka onay" in info["list_name"]:
                     if not is_green:
                         yesile_boya.append({**t, "id": tid})
