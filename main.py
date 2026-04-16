@@ -52,6 +52,9 @@ RECIPIENT_EMAIL = os.environ.get("RECIPIENT_EMAIL", "ertugozerr@gmail.com")
 STATE_DIR        = os.environ.get("STATE_DIR", "/tmp")
 STATE_FILE       = os.path.join(STATE_DIR, "bc_state.json")
 WEBHOOK_LOG_FILE = os.path.join(STATE_DIR, "bc_webhook_log.json")
+NOTES_FILE       = os.path.join(STATE_DIR, "bc_notes.json")
+SPRINTS_FILE     = os.path.join(STATE_DIR, "bc_sprints.json")
+CHANGELOG_FILE   = os.path.join(STATE_DIR, "bc_changelog.md")
 
 # ─── Webhook güvenliği ─────────────────────────────────────────────────────
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
@@ -422,6 +425,332 @@ def load_webhook_log() -> list:
             return json.load(f)
     except Exception:
         return []
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  NOTLAR
+# ══════════════════════════════════════════════════════════════════════════
+
+def load_notes() -> dict:
+    """{'İş Adı': {'text': '...', 'time': 'gg.aa.yyyy HH:MM'}}"""
+    try:
+        with open(NOTES_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_note(item_name: str, note_text: str):
+    notes = load_notes()
+    if note_text.strip():
+        notes[item_name] = {
+            "text": note_text.strip(),
+            "time": datetime.now().strftime("%d.%m.%Y %H:%M"),
+        }
+    else:
+        notes.pop(item_name, None)   # boş not = sil
+    try:
+        with open(NOTES_FILE, "w", encoding="utf-8") as f:
+            json.dump(notes, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"⚠️  Not kayıt: {e}")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  SPRINT / KAMPANYA
+# ══════════════════════════════════════════════════════════════════════════
+
+def load_sprints() -> list:
+    try:
+        with open(SPRINTS_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+
+def save_sprint(name: str, start: str, end: str):
+    sprints = load_sprints()
+    sprints.append({
+        "name":    name,
+        "start":   start,   # YYYY-MM-DD
+        "end":     end,
+        "created": datetime.now().strftime("%d.%m.%Y %H:%M"),
+    })
+    try:
+        with open(SPRINTS_FILE, "w", encoding="utf-8") as f:
+            json.dump(sprints, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"⚠️  Sprint kayıt: {e}")
+
+
+def get_active_sprint() -> dict | None:
+    today = datetime.now().strftime("%Y-%m-%d")
+    for s in reversed(load_sprints()):
+        if s.get("start", "") <= today <= s.get("end", ""):
+            return s
+    return None
+
+
+def build_sprint_page(sprint: dict, history: list) -> str:
+    """Bir sprint / kampanya için özet HTML sayfası."""
+    start = sprint.get("start", "")
+    end   = sprint.get("end", "")
+    name  = sprint.get("name", "Sprint")
+
+    entries = [h for h in history if start <= h.get("date", "") <= end]
+    entries_sorted = sorted(entries, key=lambda x: x.get("date", ""))
+
+    total_completed = len({n for h in entries for n in h.get("completed", [])})
+    total_new_onay  = len({n for h in entries for n in h.get("new_onay", [])})
+    total_ekle      = sum(h.get("ekle_count", 0) for h in entries)
+    report_count    = len(entries)
+
+    day_rows = ""
+    for h in entries_sorted:
+        compl = len(h.get("completed", []))
+        onay  = len(h.get("new_onay", []))
+        day_rows += (
+            f"<tr>"
+            f"<td style='padding:7px 12px;border-bottom:1px solid #eee;font-size:13px;'>{h.get('date','')}</td>"
+            f"<td style='padding:7px 12px;border-bottom:1px solid #eee;text-align:center;'>"
+            f"<span style='background:#00b050;color:#fff;border-radius:3px;padding:1px 8px;font-size:12px;'>{h.get('yesile_count',0)}</span></td>"
+            f"<td style='padding:7px 12px;border-bottom:1px solid #eee;text-align:center;'>"
+            f"<span style='background:#e53935;color:#fff;border-radius:3px;padding:1px 8px;font-size:12px;'>{h.get('sil_count',0)}</span></td>"
+            f"<td style='padding:7px 12px;border-bottom:1px solid #eee;text-align:center;font-weight:bold;color:#00b050;'>"
+            f"{'+ ' + str(compl) if compl else '—'}</td>"
+            f"<td style='padding:7px 12px;border-bottom:1px solid #eee;text-align:center;font-weight:bold;color:#1976d2;'>"
+            f"{'+ ' + str(onay) if onay else '—'}</td>"
+            f"</tr>"
+        )
+    if not day_rows:
+        day_rows = "<tr><td colspan='5' style='padding:16px;text-align:center;color:#888;'>Bu tarih aralığında rapor yok.</td></tr>"
+
+    all_sprints = load_sprints()
+    sprint_links = ""
+    for i, s in enumerate(reversed(all_sprints)):
+        s_start = s.get("start", "")
+        s_end   = s.get("end", "")
+        s_name  = s.get("name", "Sprint")
+        active  = s_start == start and s_end == end
+        bg = "#1976d2" if active else "#e0e0e0"
+        fg = "#fff" if active else "#333"
+        sprint_links += (
+            f"<a href='/sprint?start={s_start}&end={s_end}' "
+            f"style='background:{bg};color:{fg};padding:5px 12px;border-radius:5px;"
+            f"font-size:12px;text-decoration:none;margin-right:6px;'>{s_name}</a>"
+        )
+
+    return f"""<!DOCTYPE html>
+<html><head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Sprint · {name}</title>
+  <style>body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,sans-serif;background:#f0f2f5;margin:0;padding:20px;}}
+  .wrap{{max-width:820px;margin:0 auto;}} a{{color:#1976d2;text-decoration:none;}} a:hover{{text-decoration:underline;}}</style>
+</head>
+<body><div class="wrap">
+  <div style='background:linear-gradient(135deg,#1a1a2e,#16213e);color:#fff;border-radius:12px;padding:22px 26px;margin-bottom:20px;'>
+    <div style='font-size:11px;text-transform:uppercase;letter-spacing:1px;opacity:.7;'>PunchBBDO — Sprint Takibi</div>
+    <div style='font-size:24px;font-weight:bold;margin-top:4px;'>🏃 {name}</div>
+    <div style='font-size:13px;opacity:.7;margin-top:4px;'>{start} → {end} &nbsp;·&nbsp; {report_count} rapor</div>
+    <div style='margin-top:12px;'>{sprint_links}</div>
+  </div>
+  <div style='display:flex;gap:10px;margin-bottom:20px;flex-wrap:wrap;'>
+    <div style='flex:1;min-width:110px;background:#fff;border-radius:8px;padding:14px;box-shadow:0 1px 4px rgba(0,0,0,.08);text-align:center;border-top:3px solid #00b050;'>
+      <div style='font-size:30px;font-weight:bold;color:#00b050;'>{total_completed}</div>
+      <div style='font-size:12px;color:#666;margin-top:4px;'>Tamamlandı</div></div>
+    <div style='flex:1;min-width:110px;background:#fff;border-radius:8px;padding:14px;box-shadow:0 1px 4px rgba(0,0,0,.08);text-align:center;border-top:3px solid #1976d2;'>
+      <div style='font-size:30px;font-weight:bold;color:#1976d2;'>{total_new_onay}</div>
+      <div style='font-size:12px;color:#666;margin-top:4px;'>Marka Onayına Geldi</div></div>
+    <div style='flex:1;min-width:110px;background:#fff;border-radius:8px;padding:14px;box-shadow:0 1px 4px rgba(0,0,0,.08);text-align:center;border-top:3px solid #9c27b0;'>
+      <div style='font-size:30px;font-weight:bold;color:#9c27b0;'>{total_ekle}</div>
+      <div style='font-size:12px;color:#666;margin-top:4px;'>Excel'e Eklendi</div></div>
+    <div style='flex:1;min-width:110px;background:#fff;border-radius:8px;padding:14px;box-shadow:0 1px 4px rgba(0,0,0,.08);text-align:center;border-top:3px solid #607d8b;'>
+      <div style='font-size:30px;font-weight:bold;color:#607d8b;'>{report_count}</div>
+      <div style='font-size:12px;color:#666;margin-top:4px;'>Rapor Çalıştı</div></div>
+  </div>
+  <div style='background:#fff;border-radius:10px;box-shadow:0 1px 4px rgba(0,0,0,.1);overflow:hidden;margin-bottom:20px;'>
+    <div style='background:#1a1a2e;color:#fff;padding:12px 16px;font-weight:bold;'>📊 Günlük Detay</div>
+    <table style='width:100%;border-collapse:collapse;'>
+      <tr style='background:#fafafa;'>
+        <th style='padding:7px 12px;text-align:left;font-size:12px;color:#888;'>Tarih</th>
+        <th style='padding:7px 12px;text-align:center;font-size:12px;color:#888;'>Onayda</th>
+        <th style='padding:7px 12px;text-align:center;font-size:12px;color:#888;'>Silinecek</th>
+        <th style='padding:7px 12px;text-align:center;font-size:12px;color:#888;'>Tamamlandı</th>
+        <th style='padding:7px 12px;text-align:center;font-size:12px;color:#888;'>Yeni Onay</th>
+      </tr>{day_rows}
+    </table>
+  </div>
+  <div style='text-align:center;font-size:11px;color:#aaa;'>
+    <a href='/dashboard'>← Dashboard</a> &nbsp;·&nbsp;
+    <a href='/sprint/new'>+ Yeni Sprint</a>
+  </div>
+</div></body></html>"""
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  CHANGELOG
+# ══════════════════════════════════════════════════════════════════════════
+
+def append_changelog(changes: list, today: str, trigger: str):
+    """Her rapordaki değişiklikleri kalıcı markdown dosyasına ekler."""
+    if not changes:
+        return
+    try:
+        lines = [f"\n## {today}  _(tetikleyen: {trigger})_\n"]
+        for c in changes:
+            lines.append(f"- {c}\n")
+        with open(CHANGELOG_FILE, "a", encoding="utf-8") as f:
+            f.writelines(lines)
+    except Exception as e:
+        print(f"⚠️  Changelog: {e}")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  ISI HARİTASI + TAHMİN MOTORU
+# ══════════════════════════════════════════════════════════════════════════
+
+def build_heatmap_html(webhook_log: list) -> str:
+    """Webhook log → gün × saat ısı haritası HTML."""
+    # 7 × 24 matris, sadece "scheduled" event'ler sayılır
+    matrix = [[0] * 24 for _ in range(7)]   # [weekday][hour]
+    for ev in webhook_log:
+        if ev.get("status") == "ignored":
+            continue
+        time_str = ev.get("time", "")
+        try:
+            dt = datetime.strptime(time_str, "%d.%m.%Y %H:%M")
+            matrix[dt.weekday()][dt.hour] += 1
+        except Exception:
+            pass
+
+    max_val = max((matrix[d][h] for d in range(7) for h in range(24)), default=1)
+    max_val = max(max_val, 1)
+
+    day_labels = ["Pzt", "Sal", "Çar", "Per", "Cum", "Cmt", "Paz"]
+    # Sadece iş saatlerini göster: 8–20
+    show_hours = list(range(8, 21))
+
+    header = "<tr><th style='padding:3px 6px;font-size:10px;color:#888;text-align:right;'>Saat →</th>"
+    for h in show_hours:
+        header += f"<th style='padding:3px 4px;font-size:10px;color:#888;text-align:center;'>{h}</th>"
+    header += "</tr>"
+
+    rows_html = ""
+    for d in range(7):
+        row = f"<tr><td style='padding:3px 6px;font-size:11px;color:#555;font-weight:bold;text-align:right;'>{day_labels[d]}</td>"
+        for h in show_hours:
+            v = matrix[d][h]
+            intensity = v / max_val
+            # Renk: 0=beyaz, yüksek=koyu mavi
+            r = int(255 - intensity * 25)
+            g = int(255 - intensity * 100)
+            b = int(255 - intensity * 0)
+            # Aslında mavi ton: beyazdan koyu maviye
+            r2 = int(255 - intensity * 200)
+            g2 = int(255 - intensity * 130)
+            b2 = 255
+            bg = f"rgb({r2},{g2},{b2})" if v > 0 else "#f5f5f5"
+            fg = "#fff" if intensity > 0.6 else "#333"
+            title = f"{day_labels[d]} {h}:00 — {v} event"
+            row += (f"<td title='{title}' style='padding:4px 3px;text-align:center;"
+                    f"background:{bg};color:{fg};font-size:10px;border-radius:3px;min-width:22px;'>"
+                    f"{'  ' if v == 0 else str(v)}</td>")
+        row += "</tr>"
+        rows_html += row
+
+    if max_val == 1 and all(matrix[d][h] == 0 for d in range(7) for h in range(24)):
+        return ""  # log boşsa section gösterme
+
+    return (
+        f"<div style='background:#fff;border-radius:10px;box-shadow:0 1px 4px rgba(0,0,0,.1);"
+        f"padding:16px;margin-bottom:20px;overflow-x:auto;'>"
+        f"<div style='font-weight:bold;font-size:14px;color:#333;margin-bottom:10px;'>"
+        f"🌡️ Aktivite Isı Haritası <span style='font-size:11px;color:#aaa;font-weight:normal;'>"
+        f"(webhook event'ler, iş saatleri 08–20)</span></div>"
+        f"<table style='border-collapse:separate;border-spacing:2px;'>"
+        f"{header}{rows_html}</table>"
+        f"<div style='margin-top:8px;font-size:11px;color:#aaa;'>"
+        f"Beyaz = 0, koyu mavi = yoğun aktivite</div></div>"
+    )
+
+
+def build_forecast_widget(history: list) -> str:
+    """Son 4 haftanın ortalamasından bu hafta tahmini."""
+    if len(history) < 3:
+        return ""
+
+    # history entry'lerine hafta numarası ekle
+    weekly: dict = defaultdict(lambda: {"yesile": [], "sil": [], "ekle": []})
+    for h in history:
+        date_str = h.get("date", "")
+        try:
+            dt      = datetime.strptime(date_str, "%Y-%m-%d")
+            week_key = dt.strftime("%Y-W%W")
+            weekly[week_key]["yesile"].append(h.get("yesile_count", 0))
+            weekly[week_key]["sil"].append(h.get("sil_count", 0))
+            weekly[week_key]["ekle"].append(h.get("ekle_count", 0))
+        except Exception:
+            pass
+
+    # Son 4 tam hafta (bu haftayı hariç tut)
+    current_week = datetime.now().strftime("%Y-W%W")
+    past_weeks = sorted([k for k in weekly if k != current_week], reverse=True)[:4]
+    if not past_weeks:
+        return ""
+
+    def avg(cat):
+        vals = [sum(weekly[w][cat]) / max(len(weekly[w][cat]), 1) for w in past_weeks]
+        return round(sum(vals) / len(vals), 1)
+
+    avg_yesile = avg("yesile")
+    avg_sil    = avg("sil")
+    avg_ekle   = avg("ekle")
+    basis      = len(past_weeks)
+
+    return (
+        f"<div style='background:#fff;border-radius:10px;padding:16px 20px;"
+        f"box-shadow:0 1px 4px rgba(0,0,0,.1);margin-bottom:20px;"
+        f"border-left:4px solid #7b1fa2;'>"
+        f"<div style='font-weight:bold;font-size:14px;color:#7b1fa2;margin-bottom:10px;'>"
+        f"🔮 Bu Hafta Tahmini <span style='font-size:11px;color:#aaa;font-weight:normal;'>"
+        f"(son {basis} haftanın günlük ortalaması)</span></div>"
+        f"<div style='display:flex;gap:16px;flex-wrap:wrap;'>"
+        f"<div style='text-align:center;'>"
+        f"<div style='font-size:26px;font-weight:bold;color:#00b050;'>{avg_yesile}</div>"
+        f"<div style='font-size:11px;color:#888;'>Marka Onayına/gün</div></div>"
+        f"<div style='text-align:center;'>"
+        f"<div style='font-size:26px;font-weight:bold;color:#e53935;'>{avg_sil}</div>"
+        f"<div style='font-size:11px;color:#888;'>Tamamlanacak/gün</div></div>"
+        f"<div style='text-align:center;'>"
+        f"<div style='font-size:26px;font-weight:bold;color:#1976d2;'>{avg_ekle}</div>"
+        f"<div style='font-size:11px;color:#888;'>Yeni İş/gün</div></div>"
+        f"</div></div>"
+    )
+
+
+def _build_notes_list(notes: dict) -> str:
+    """Mevcut notlar listesini HTML olarak döndürür (f-string dışında üretir)."""
+    if not notes:
+        return ""
+    rows = ""
+    for item_n, nd in notes.items():
+        # URL-safe delete link: & → %26, ' → %27
+        safe_key = urllib.parse.quote(item_n, safe="")
+        rows += (
+            f"<div style='display:flex;justify-content:space-between;align-items:center;"
+            f"padding:6px 0;border-bottom:1px solid #f5f5f5;'>"
+            f"<div><b style='font-size:13px;'>{item_n}</b>"
+            f"<span style='color:#7b1fa2;font-size:12px;'> — {nd.get('text','')}</span>"
+            f"<span style='color:#bbb;font-size:11px;'> ({nd.get('time','')})</span></div>"
+            f"<a href='/note?delete={safe_key}' style='color:#e53935;font-size:11px;'>sil</a>"
+            f"</div>"
+        )
+    return (
+        "<div style='margin-top:14px;'>"
+        "<div style='font-size:12px;color:#888;margin-bottom:6px;'>Mevcut notlar:</div>"
+        + rows
+        + "</div>"
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -884,6 +1213,9 @@ def _run_report_inner(today: str, trigger: str) -> str:
     prev_state = load_state()
     changes    = compute_changes(prev_state, sil_listesi, yesile_boya, renksiz_yap, ekle_listesi)
     first_seen = save_state(sil_listesi, yesile_boya, renksiz_yap, ekle_listesi, url_eksik, today)
+
+    # Değişiklikleri kalıcı changelog dosyasına yaz
+    append_changelog(changes, today, trigger)
 
     report      = build_report(yesile_boya, renksiz_yap, sil_listesi, ekle_listesi, url_eksik, today, excel_error, changes, first_seen)
     report_html = build_html_report(yesile_boya, renksiz_yap, sil_listesi, ekle_listesi, url_eksik, today, excel_error, changes, first_seen)
@@ -1379,21 +1711,36 @@ def dashboard():
     ) if long_waiters else ""
 
     # ─── Mevcut durum önizlemesi ─────────────────────────────────────────
+    notes = load_notes()
+
     def preview_list(items, category, color, icon, label):
         if not items:
             return ""
         rows = ""
         for it in items:
-            days  = get_days_in_category(first_seen, category, it["name"])
-            badge = _dur_badge_html(days)
-            bc_link = _bc_url(it)
-            safe_name = it['name'].replace("'", "&#39;")
+            days      = get_days_in_category(first_seen, category, it["name"])
+            badge     = _dur_badge_html(days)
+            bc_link   = _bc_url(it)
+            safe_name = it["name"].replace("'", "&#39;")
             name_html = (f"<a href='{bc_link}' target='_blank' style='color:#333;"
                          f"text-decoration:none;font-weight:bold;'>{it['name']} ↗</a>"
                          if bc_link else f"<b>{it['name']}</b>")
-            rows += (f"<li class='search-item' data-name='{safe_name}' "
-                     f"style='padding:4px 0;border-bottom:1px solid #f5f5f5;'>{name_html} "
-                     f"<span style='color:#aaa;font-size:11px;'>— {it.get('brand','')}</span>{badge}</li>")
+            note_info = notes.get(it["name"])
+            note_html = ""
+            if note_info:
+                note_text = note_info.get("text", "")
+                note_time = note_info.get("time", "")
+                note_html = (f"<div style='margin-top:2px;font-size:11px;color:#7b1fa2;"
+                             f"background:#f3e5f5;border-radius:3px;padding:2px 6px;display:inline-block;'>"
+                             f"📝 {note_text}"
+                             f"<span style='color:#bbb;margin-left:6px;'>{note_time}</span></div>")
+            rows += (
+                f"<li class='search-item' data-name='{safe_name}' "
+                f"style='padding:5px 0;border-bottom:1px solid #f5f5f5;'>"
+                f"{name_html} "
+                f"<span style='color:#aaa;font-size:11px;'>— {it.get('brand','')}</span>"
+                f"{badge}{note_html}</li>"
+            )
         return (f"<div style='flex:1;min-width:220px;background:#fff;border-radius:8px;"
                 f"box-shadow:0 1px 4px rgba(0,0,0,.08);overflow:hidden;border-left:4px solid {color};'>"
                 f"<div style='background:{color};color:#fff;padding:8px 12px;"
@@ -1458,6 +1805,66 @@ def dashboard():
         f"{last_error.get('message','')}</pre></div>"
     ) if last_error else ""
 
+    # ─── Sprint badge ──────────────────────────────────────────────────────
+    active_sprint = get_active_sprint()
+    if active_sprint:
+        sp_name = active_sprint.get("name", "Sprint")
+        sp_end  = active_sprint.get("end", "")
+        sprint_badge_html = (
+            f"<a href='/sprint' style='background:#7b1fa2;color:#fff;padding:5px 14px;"
+            f"border-radius:5px;font-size:12px;text-decoration:none;display:inline-block;margin-top:6px;'>"
+            f"🏃 {sp_name} &nbsp;→&nbsp; {sp_end}</a>"
+        )
+    else:
+        sprint_badge_html = (
+            f"<a href='/sprint/new' style='background:rgba(123,31,162,.25);color:#ce93d8;"
+            f"padding:5px 14px;border-radius:5px;font-size:12px;text-decoration:none;"
+            f"display:inline-block;margin-top:6px;'>+ Sprint / Kampanya tanımla</a>"
+        )
+
+    # ─── Tahmin widget'ı ───────────────────────────────────────────────────
+    forecast_section = build_forecast_widget(history)
+
+    # ─── Isı haritası ──────────────────────────────────────────────────────
+    heatmap_section = build_heatmap_html(webhook_log)
+
+    # ─── Not formu ─────────────────────────────────────────────────────────
+    all_item_names = sorted({
+        it["name"]
+        for cat in ["sil", "yesile", "renksiz", "ekle", "url_eksik"]
+        for it in _as_items(state.get(cat, []))
+    })
+    note_options = "<option value=''>— İş seç —</option>"
+    for n in all_item_names:
+        safe_n = n.replace("'", "&#39;").replace('"', "&quot;")
+        existing = notes.get(n, {}).get("text", "")
+        sel = " selected" if existing else ""
+        note_options += f"<option value='{safe_n}'{sel}>{n}</option>"
+
+    notes_form_section = (
+        f"<details style='margin-bottom:20px;'>"
+        f"<summary style='cursor:pointer;background:#fff;border-radius:10px;"
+        f"box-shadow:0 1px 4px rgba(0,0,0,.1);padding:14px 18px;"
+        f"font-weight:bold;font-size:14px;list-style:none;color:#7b1fa2;'>📝 İş Notları ▾</summary>"
+        f"<div style='background:#fff;border-radius:0 0 10px 10px;padding:16px 18px;"
+        f"box-shadow:0 2px 4px rgba(0,0,0,.08);margin-top:-4px;'>"
+        f"<form method='POST' action='/note' style='display:flex;flex-wrap:wrap;gap:10px;align-items:flex-end;'>"
+        f"<div style='flex:2;min-width:180px;'>"
+        f"<label style='font-size:12px;color:#888;display:block;margin-bottom:4px;'>İş Adı</label>"
+        f"<select name='item_name' style='width:100%;padding:8px 10px;border:1px solid #ddd;"
+        f"border-radius:6px;font-size:13px;'>{note_options}</select></div>"
+        f"<div style='flex:3;min-width:200px;'>"
+        f"<label style='font-size:12px;color:#888;display:block;margin-bottom:4px;'>Not (boş bırakırsan silinir)</label>"
+        f"<input type='text' name='note_text' id='noteInput' placeholder='Örn: kliyente soruldu, revizyon bekleniyor...' maxlength='200'"
+        f" style='width:100%;box-sizing:border-box;padding:8px 10px;border:1px solid #ddd;"
+        f"border-radius:6px;font-size:13px;'></div>"
+        f"<button type='submit' style='padding:8px 20px;background:#7b1fa2;color:#fff;"
+        f"border:none;border-radius:6px;font-size:13px;cursor:pointer;font-weight:bold;'>Kaydet</button>"
+        f"</form>"
+        + _build_notes_list(notes)
+        + f"</div></details>"
+    )
+
     return f"""<!DOCTYPE html>
 <html><head>
   <meta charset="utf-8">
@@ -1491,6 +1898,7 @@ def dashboard():
         <div style='display:flex;gap:6px;margin-top:10px;flex-wrap:wrap;'>
           {fbtn('Tümü','')}{fbtn('Hopi','hopi')}{fbtn('Metro','metro')}
         </div>
+        {sprint_badge_html}
       </div>
       <div style='display:flex;gap:8px;flex-wrap:wrap;align-items:flex-start;'>
         <a href='/run' style='background:#00b050;color:#fff;padding:8px 16px;border-radius:6px;font-size:13px;font-weight:bold;text-decoration:none;'>▶ Rapor Çalıştır</a>
@@ -1548,11 +1956,14 @@ def dashboard():
     </div>
   </div>
 
+  {forecast_section}
   {stat_cards}
   {brands_table}
   {waiter_section}
   {trend_section}
+  {heatmap_section}
   {preview_section}
+  {notes_form_section}
 
   <div style='background:#fff;border-radius:10px;box-shadow:0 1px 4px rgba(0,0,0,.1);overflow:hidden;margin-bottom:20px;'>
     <div style='background:#1a1a2e;color:#fff;padding:12px 16px;font-weight:bold;'>
@@ -1576,7 +1987,8 @@ def dashboard():
   <div style='text-align:center;font-size:11px;color:#aaa;margin-top:4px;'>
     bc-takip-production.up.railway.app ·
     <a href='/run'>Manuel</a> · <a href='/status'>BC Durumu</a> ·
-    <a href='/history'>Geçmiş</a> · <a href='/deadlines'>Deadline</a> ·
+    <a href='/history'>Geçmiş</a> · <a href='/sprint'>Sprint</a> ·
+    <a href='/changelog'>Changelog</a> · <a href='/deadlines'>Deadline</a> ·
     <a href='/export.csv'>CSV</a> · <a href='/health'>Health</a> · <a href='/debug-excel'>Excel Debug</a>
   </div>
 </div></body></html>""", 200
@@ -1807,6 +2219,215 @@ def debug():
         except Exception as e:
             lines.append(f"Hata: {e}")
     return f"<pre>{chr(10).join(lines)}</pre>", 200
+
+
+# ── /api/state ─────────────────────────────────────────────────────────────
+
+@app.route("/api/state")
+def api_state():
+    """Token korumalı JSON API — dışarıdan sorgulama için."""
+    if WEBHOOK_SECRET:
+        if request.args.get("token", "") != WEBHOOK_SECRET:
+            return jsonify({"error": "unauthorized"}), 401
+    state = load_state()
+    if not state:
+        return jsonify({"error": "no_data"}), 404
+    # Sadece sayısal özet + listeler — ham state değil
+    fs = state.get("first_seen", {})
+    def enrich(items, cat):
+        result = []
+        for it in _as_items(items):
+            d = get_days_in_category(fs, cat, it["name"])
+            result.append({
+                "name":       it["name"],
+                "brand":      it.get("brand", ""),
+                "days":       d,
+                "bc_url":     _bc_url(it),
+                "note":       load_notes().get(it["name"], {}).get("text", ""),
+            })
+        return result
+
+    return jsonify({
+        "timestamp":   state.get("timestamp", ""),
+        "sil":         enrich(state.get("sil", []),       "sil"),
+        "yesile":      enrich(state.get("yesile", []),    "yesile"),
+        "renksiz":     enrich(state.get("renksiz", []),   "renksiz"),
+        "ekle":        enrich(state.get("ekle", []),      "ekle"),
+        "url_eksik":   enrich(state.get("url_eksik", []), "url_eksik"),
+        "active_sprint": get_active_sprint(),
+        "summary": {
+            "total_action": (len(state.get("sil", [])) + len(state.get("yesile", [])) +
+                             len(state.get("renksiz", [])) + len(state.get("ekle", []))),
+            "avg_onay_days": avg_onay_days(fs),
+        },
+    })
+
+
+# ── /note ──────────────────────────────────────────────────────────────────
+
+@app.route("/note", methods=["POST", "GET"])
+def note_endpoint():
+    """Not ekle/güncelle (POST form) veya sil (GET ?delete=...)."""
+    if request.method == "GET":
+        item_name = request.args.get("delete", "").strip()
+        if item_name:
+            save_note(item_name, "")   # boş = sil
+        return ("<script>history.back();</script>"
+                "<a href='/dashboard'>← Dashboard</a>"), 200
+
+    item_name = (request.form.get("item_name") or "").strip()
+    note_text = (request.form.get("note_text") or "").strip()
+    if item_name:
+        save_note(item_name, note_text)
+    return ("<script>history.back();</script>"
+            "<a href='/dashboard'>← Dashboard</a>"), 200
+
+
+# ── /sprint ────────────────────────────────────────────────────────────────
+
+@app.route("/sprint")
+def sprint_page():
+    """Sprint özet sayfası. ?start=YYYY-MM-DD&end=YYYY-MM-DD ile belirli sprint."""
+    state   = load_state()
+    history = state.get("history", []) if state else []
+
+    start_q = request.args.get("start", "").strip()
+    end_q   = request.args.get("end", "").strip()
+
+    if start_q and end_q:
+        sprint = {"name": f"{start_q} → {end_q}", "start": start_q, "end": end_q}
+    else:
+        sprint = get_active_sprint()
+        if not sprint:
+            sprints = load_sprints()
+            sprint  = sprints[-1] if sprints else None
+
+    if not sprint:
+        return (f"<html><body style='font-family:sans-serif;padding:40px;'>"
+                f"<h2>Henüz sprint tanımlanmamış.</h2>"
+                f"<a href='/sprint/new'>+ Yeni Sprint Oluştur</a> &nbsp;·&nbsp; "
+                f"<a href='/dashboard'>← Dashboard</a></body></html>"), 200
+
+    return build_sprint_page(sprint, history), 200
+
+
+@app.route("/sprint/new", methods=["GET", "POST"])
+def sprint_new():
+    """Sprint oluşturma formu."""
+    if request.method == "POST":
+        name  = (request.form.get("name") or "").strip()
+        start = (request.form.get("start") or "").strip()
+        end   = (request.form.get("end") or "").strip()
+        if name and start and end:
+            save_sprint(name, start, end)
+            return ("<script>window.location='/sprint';</script>"
+                    "<a href='/sprint'>Sprint sayfasına git →</a>"), 200
+        return "<p>Tüm alanları doldurun.</p><a href='/sprint/new'>Geri</a>", 400
+
+    today     = datetime.now().strftime("%Y-%m-%d")
+    two_weeks = (datetime.now() + timedelta(days=14)).strftime("%Y-%m-%d")
+    return f"""<!DOCTYPE html>
+<html><head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Yeni Sprint</title>
+  <style>body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#f0f2f5;margin:0;padding:40px;}}
+  .card{{max-width:460px;margin:0 auto;background:#fff;border-radius:12px;padding:28px;box-shadow:0 2px 8px rgba(0,0,0,.1);}}
+  label{{font-size:12px;color:#888;display:block;margin-bottom:4px;margin-top:14px;}}
+  input{{width:100%;box-sizing:border-box;padding:9px 12px;border:1px solid #ddd;border-radius:6px;font-size:14px;}}
+  input:focus{{outline:none;border-color:#7b1fa2;box-shadow:0 0 0 3px rgba(123,31,162,.15);}}
+  button{{margin-top:20px;width:100%;padding:11px;background:#7b1fa2;color:#fff;border:none;border-radius:6px;font-size:14px;font-weight:bold;cursor:pointer;}}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div style='font-size:22px;font-weight:bold;color:#7b1fa2;margin-bottom:4px;'>🏃 Yeni Sprint / Kampanya</div>
+    <div style='font-size:13px;color:#888;margin-bottom:20px;'>
+      History verisi bu tarih aralığına göre filtrelenecek.
+    </div>
+    <form method="POST" action="/sprint/new">
+      <label>Sprint / Kampanya Adı</label>
+      <input type="text" name="name" placeholder="Örn: Mayıs Kampanyası, Q2 Sprint" required>
+      <label>Başlangıç Tarihi</label>
+      <input type="date" name="start" value="{today}" required>
+      <label>Bitiş Tarihi</label>
+      <input type="date" name="end" value="{two_weeks}" required>
+      <button type="submit">Sprint Oluştur</button>
+    </form>
+    <div style='text-align:center;margin-top:16px;font-size:12px;'>
+      <a href='/sprint' style='color:#7b1fa2;'>← Mevcut Sprintler</a> &nbsp;·&nbsp;
+      <a href='/dashboard' style='color:#1976d2;'>Dashboard</a>
+    </div>
+  </div>
+</body></html>""", 200
+
+
+# ── /changelog ─────────────────────────────────────────────────────────────
+
+@app.route("/changelog")
+def changelog_page():
+    """Otomatik kaydedilen değişiklik geçmişi."""
+    try:
+        with open(CHANGELOG_FILE, encoding="utf-8") as f:
+            raw = f.read()
+    except FileNotFoundError:
+        raw = "_Henüz değişiklik kaydedilmemiş. Bir rapor çalıştırıldıktan sonra burada görünür._"
+    except Exception as e:
+        raw = f"Dosya okunamadı: {e}"
+
+    # Markdown-light render: ## → başlık, - → liste
+    import html as _html
+    lines   = raw.splitlines()
+    out     = []
+    in_list = False
+    for line in lines:
+        escaped = _html.escape(line)
+        if line.startswith("## "):
+            if in_list:
+                out.append("</ul>"); in_list = False
+            title = _html.escape(line[3:])
+            out.append(f"<h3 style='margin:20px 0 6px;color:#1a1a2e;font-size:14px;border-bottom:1px solid #eee;padding-bottom:4px;'>{title}</h3>")
+        elif line.startswith("- "):
+            if not in_list:
+                out.append("<ul style='margin:4px 0;padding-left:20px;font-size:13px;color:#444;'>")
+                in_list = True
+            out.append(f"<li style='padding:2px 0;'>{_html.escape(line[2:])}</li>")
+        elif line.startswith("_") and line.endswith("_"):
+            if in_list:
+                out.append("</ul>"); in_list = False
+            out.append(f"<p style='color:#888;font-style:italic;font-size:13px;'>{_html.escape(line[1:-1])}</p>")
+        elif line.strip():
+            if in_list:
+                out.append("</ul>"); in_list = False
+    if in_list:
+        out.append("</ul>")
+
+    content_html = "\n".join(out) or "<p style='color:#888;'>Değişiklik yok.</p>"
+    entry_count  = raw.count("## ")
+
+    return f"""<!DOCTYPE html>
+<html><head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>BC Takip · Changelog</title>
+  <style>body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#f0f2f5;margin:0;padding:20px;}}
+  .wrap{{max-width:760px;margin:0 auto;}} a{{color:#1976d2;text-decoration:none;}} a:hover{{text-decoration:underline;}}</style>
+</head>
+<body><div class="wrap">
+  <div style='background:linear-gradient(135deg,#1a1a2e,#16213e);color:#fff;border-radius:12px;padding:22px 26px;margin-bottom:20px;
+              display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px;'>
+    <div>
+      <div style='font-size:11px;text-transform:uppercase;letter-spacing:1px;opacity:.7;'>PunchBBDO — Excel Takip</div>
+      <div style='font-size:24px;font-weight:bold;margin-top:4px;'>📜 Changelog</div>
+      <div style='font-size:13px;opacity:.7;margin-top:4px;'>{entry_count} değişiklik kaydı</div>
+    </div>
+    <a href='/dashboard' style='background:rgba(255,255,255,.15);color:#fff;padding:8px 16px;border-radius:6px;font-size:13px;text-decoration:none;'>← Dashboard</a>
+  </div>
+  <div style='background:#fff;border-radius:10px;box-shadow:0 1px 4px rgba(0,0,0,.1);padding:20px 24px;'>
+    {content_html}
+  </div>
+  <div style='text-align:center;font-size:11px;color:#aaa;margin-top:16px;'>
+    <a href='/dashboard'>Dashboard</a> · <a href='/history'>Geçmiş</a>
+  </div>
+</div></body></html>""", 200
 
 
 @app.route("/export.csv")
