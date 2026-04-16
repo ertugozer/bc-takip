@@ -1,18 +1,22 @@
 #!/usr/bin/env python3
 """
-Basecamp–Excel Karşılaştırma Raporu v4
+Basecamp–Excel Karşılaştırma Raporu v5
 ───────────────────────────────────────
-YENİ (v4):
-  • Dashboard — toplam aksiyon sayısı (büyük sayaç), sonraki rapor countdown
-  • Dashboard — Hopi / Metro karşılaştırma tablosu
-  • Dashboard — 14 günlük CSS trend grafiği (JS yok)
-  • Dashboard — her item'a Basecamp URL linki
-  • Dashboard — ortalama Marka Onayı bekleme süresi
-  • Dashboard — son 10 webhook event logu
-  • Dashboard — 5 dakikada bir otomatik yenileme
-  • /status   — salt Basecamp iş durumu sayfası (Excel katmanı yok)
+YENİ (v5):
+  • Sabah 09:00 digest maili — API çağrısı yapmadan mevcut state özeti
+  • Deadline takibi — due_on bugün/yarın olan işler sabah 09:01'de uyarı
+  • /deadlines    — deadline kontrolü manuel tetikleme
+  • /export.csv   — mevcut state'i CSV olarak indir
+  • Dashboard — JS arama kutusu (item adına göre anlık filtre)
+  • Dashboard — dark mode toggle (localStorage kalıcı)
+  • Dashboard — CSV export butonu
+  • Webhook log   — 30 günlük rotasyon (önceki: sadece son 10 event)
 
-ÖNCEKİ SÜRÜMLERDEN:
+ÖNCEKİ SÜRÜMLERDEN (v4):
+  Hero metrics, marka karşılaştırma, CSS trend grafiği, BC URL linkleri,
+  ortalama onay süresi, webhook log, 5dk otomatik yenileme, /status sayfası
+
+ÖNCEKİ SÜRÜMLERDEN (v1-v3):
   State kalıcılığı (STATE_DIR), hata uyarısı, /history, brand filtresi,
   dashboard önizleme, webhook güvenliği (WEBHOOK_SECRET), debounce,
   haftalık özet, süre takibi (first_seen), URL eksik kategorisi
@@ -380,8 +384,12 @@ def compute_changes(prev, sil, yesile, renksiz, ekle) -> list[str]:
 #  WEBHOOK LOG
 # ══════════════════════════════════════════════════════════════════════════
 
+WEBHOOK_LOG_KEEP_DAYS = 30
+WEBHOOK_LOG_MAX       = 2000   # maksimum satır (dosya şişmesin)
+
+
 def log_webhook_event(kind: str, status: str):
-    """Son 10 webhook event'ini ayrı dosyaya kaydeder."""
+    """Webhook event'lerini 30 gün saklayan döngüsel log."""
     try:
         try:
             with open(WEBHOOK_LOG_FILE, encoding="utf-8") as f:
@@ -393,8 +401,17 @@ def log_webhook_event(kind: str, status: str):
             "kind":   kind,
             "status": status,
         })
+        # 30 günden eski entryleri at
+        cutoff = datetime.now() - timedelta(days=WEBHOOK_LOG_KEEP_DAYS)
+        def _parse(t):
+            try:
+                return datetime.strptime(t, "%d.%m.%Y %H:%M")
+            except Exception:
+                return datetime.min
+        log = [e for e in log if _parse(e.get("time", "")) >= cutoff]
+        log = log[:WEBHOOK_LOG_MAX]   # güvenlik tavanı
         with open(WEBHOOK_LOG_FILE, "w", encoding="utf-8") as f:
-            json.dump(log[:10], f, ensure_ascii=False)
+            json.dump(log, f, ensure_ascii=False)
     except Exception as e:
         print(f"⚠️  Webhook log: {e}")
 
@@ -897,6 +914,231 @@ def run_weekly_summary():
 
 
 # ══════════════════════════════════════════════════════════════════════════
+#  SABAH DİGEST (09:00 — API çağrısı yok, state'den okur)
+# ══════════════════════════════════════════════════════════════════════════
+
+def build_digest_html(state: dict) -> str:
+    today      = datetime.now().strftime("%d.%m.%Y")
+    fs         = state.get("first_seen", {})
+    ts         = state.get("timestamp", "—")
+
+    sil_items     = _as_items(state.get("sil", []))
+    yesile_items  = _as_items(state.get("yesile", []))
+    renksiz_items = _as_items(state.get("renksiz", []))
+    ekle_items    = _as_items(state.get("ekle", []))
+    total         = len(sil_items) + len(yesile_items) + len(renksiz_items) + len(ekle_items)
+
+    # Uzun bekleyenler
+    long_waiters = []
+    for key, date_str in fs.items():
+        if not key.startswith("yesile:"):
+            continue
+        name = key[len("yesile:"):]
+        try:
+            days = (datetime.now().date() - datetime.strptime(date_str, "%Y-%m-%d").date()).days
+            if days >= 3:
+                long_waiters.append((name, days))
+        except Exception:
+            pass
+    long_waiters.sort(key=lambda x: -x[1])
+
+    def mini_card(label, count, color):
+        return (f"<div style='flex:1;min-width:100px;background:#fff;border-radius:8px;"
+                f"padding:12px 16px;text-align:center;box-shadow:0 1px 4px rgba(0,0,0,.08);"
+                f"border-top:3px solid {color};'>"
+                f"<div style='font-size:28px;font-weight:bold;color:{color};'>{count}</div>"
+                f"<div style='font-size:11px;color:#888;margin-top:2px;'>{label}</div></div>")
+
+    waiter_rows = "".join(
+        f"<li style='padding:3px 0;'><b>{n}</b> — "
+        f"<span style='color:{'#c62828' if d>=7 else '#f57c00'};font-weight:bold;'>{d} gün</span></li>"
+        for n, d in long_waiters[:5]
+    )
+    waiter_block = (
+        f"<div style='background:#fff8e1;border:1px solid #ffe082;border-radius:8px;"
+        f"padding:12px 16px;margin-top:16px;'>"
+        f"<div style='font-weight:bold;color:#f57c00;margin-bottom:6px;'>⏰ Uzun Bekleyenler ({len(long_waiters)} iş)</div>"
+        f"<ul style='margin:0;padding-left:18px;font-size:13px;color:#555;'>{waiter_rows}</ul>"
+        + (f"<div style='font-size:11px;color:#aaa;margin-top:4px;'>...ve {len(long_waiters)-5} daha</div>"
+           if len(long_waiters) > 5 else "")
+        + f"</div>"
+    ) if long_waiters else ""
+
+    hero_color = "#e53935" if total >= 5 else ("#f57c00" if total >= 2 else "#00b050")
+
+    return f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"></head>
+<body style='font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,sans-serif;background:#f5f5f5;margin:0;padding:20px;'>
+  <div style='max-width:560px;margin:0 auto;'>
+    <div style='background:linear-gradient(135deg,#1a1a2e,#16213e);color:#fff;border-radius:10px;padding:20px 24px;margin-bottom:16px;'>
+      <div style='font-size:11px;text-transform:uppercase;letter-spacing:1px;opacity:.7;margin-bottom:4px;'>PunchBBDO — Excel Takip</div>
+      <div style='font-size:22px;font-weight:bold;'>☀️ Günlük Özet</div>
+      <div style='font-size:13px;opacity:.8;margin-top:4px;'>{today} · Son rapor: {ts}</div>
+    </div>
+    <div style='background:#fff;border-radius:8px;box-shadow:0 1px 4px rgba(0,0,0,.08);padding:16px;margin-bottom:16px;border-left:5px solid {hero_color};'>
+      <div style='font-size:13px;color:#666;margin-bottom:10px;'>Bekleyen aksiyonlar:</div>
+      <div style='display:flex;gap:8px;flex-wrap:wrap;'>
+        {mini_card("SİL", len(sil_items), "#e53935")}
+        {mini_card("YEŞİLE BOYA", len(yesile_items), "#00b050")}
+        {mini_card("RENKSİZ YAP", len(renksiz_items), "#757575")}
+        {mini_card("EKLE", len(ekle_items), "#1976d2")}
+      </div>
+      {waiter_block}
+    </div>
+    <div style='text-align:center;'>
+      <a href='https://bc-takip-production.up.railway.app/dashboard'
+         style='background:#1976d2;color:#fff;padding:10px 24px;border-radius:6px;font-size:13px;font-weight:bold;text-decoration:none;'>
+        📋 Dashboard'a Git
+      </a>
+    </div>
+    <div style='text-align:center;font-size:11px;color:#aaa;margin-top:16px;'>Sabah özeti · bc-takip-production.up.railway.app</div>
+  </div>
+</body></html>"""
+
+
+def run_morning_digest():
+    """Hafta içi 09:00 — API çağrısı yapmadan mevcut state'i özetler."""
+    print("\n☀️  Sabah digest başlatıldı")
+    state = load_state()
+    if not state:
+        print("⚠️  State boş, digest atlandı")
+        return
+    today = datetime.now().strftime("%d.%m.%Y")
+    if BREVO_API_KEY:
+        try:
+            sil   = len(_as_items(state.get("sil", [])))
+            yesil = len(_as_items(state.get("yesile", [])))
+            renks = len(_as_items(state.get("renksiz", [])))
+            ekle  = len(_as_items(state.get("ekle", [])))
+            total = sil + yesil + renks + ekle
+            subject = f"☀️ Sabah Özeti — {today} ({total} aksiyon bekliyor)"
+            send_email(subject, f"Bekleyen: {total} aksiyon", build_digest_html(state))
+            print("✉️  Sabah digest gönderildi")
+        except Exception as e:
+            print(f"⚠️  Sabah digest: {e}")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  DEADLINE TAKİBİ (09:01 — BC API'si gerektirir)
+# ══════════════════════════════════════════════════════════════════════════
+
+def build_deadline_html(due_today: list, due_tomorrow: list, fetched_at: str) -> str:
+    def rows(items):
+        if not items:
+            return "<li style='color:#888;font-style:italic;'>Yok</li>"
+        return "".join(
+            f"<li style='padding:4px 0;border-bottom:1px solid #f0f0f0;'>"
+            f"<b>{t['name']}</b>"
+            f"<span style='color:#888;font-size:12px;'> — {t.get('brand','')}</span>"
+            + (f" &nbsp;<a href='{t['url']}' style='font-size:11px;color:#1976d2;'>[BC ↗]</a>"
+               if t.get("url") else "")
+            + f"</li>"
+            for t in items
+        )
+
+    today_block = (
+        f"<div style='margin:12px 0;border-radius:8px;overflow:hidden;"
+        f"box-shadow:0 1px 4px rgba(0,0,0,.08);border-left:5px solid #e53935;background:#fff;'>"
+        f"<div style='background:#e53935;color:#fff;padding:10px 16px;font-weight:bold;font-size:14px;'>"
+        f"🔴 Bugün Bitmesi Gereken ({len(due_today)})</div>"
+        f"<ul style='margin:0;padding:12px 16px 12px 32px;list-style:disc;'>{rows(due_today)}</ul></div>"
+    )
+    tomorrow_block = (
+        f"<div style='margin:12px 0;border-radius:8px;overflow:hidden;"
+        f"box-shadow:0 1px 4px rgba(0,0,0,.08);border-left:5px solid #f57c00;background:#fff;'>"
+        f"<div style='background:#f57c00;color:#fff;padding:10px 16px;font-weight:bold;font-size:14px;'>"
+        f"🟡 Yarın Bitiyor ({len(due_tomorrow)})</div>"
+        f"<ul style='margin:0;padding:12px 16px 12px 32px;list-style:disc;'>{rows(due_tomorrow)}</ul></div>"
+    )
+    total = len(due_today) + len(due_tomorrow)
+    return f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"></head>
+<body style='font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,sans-serif;background:#f5f5f5;margin:0;padding:20px;'>
+  <div style='max-width:600px;margin:0 auto;'>
+    <div style='background:linear-gradient(135deg,#b71c1c,#c62828);color:#fff;border-radius:10px;padding:20px 24px;margin-bottom:16px;'>
+      <div style='font-size:11px;text-transform:uppercase;letter-spacing:1px;opacity:.7;margin-bottom:4px;'>PunchBBDO — Excel Takip</div>
+      <div style='font-size:22px;font-weight:bold;'>⏰ Deadline Uyarısı</div>
+      <div style='font-size:13px;opacity:.8;margin-top:4px;'>{fetched_at} · {total} iş yaklaşıyor</div>
+    </div>
+    {today_block}
+    {tomorrow_block}
+    <div style='text-align:center;font-size:11px;color:#aaa;margin-top:20px;'>Deadline takibi · bc-takip-production.up.railway.app</div>
+  </div>
+</body></html>"""
+
+
+def run_deadline_check(trigger: str = "cron") -> str:
+    """Bugün ve yarın due_on olan Basecamp görevlerini bulup mail atar."""
+    print(f"\n⏰ Deadline kontrolü [{trigger}]")
+    try:
+        token = get_access_token()
+    except Exception as e:
+        print(f"⚠️  Token: {e}")
+        return f"ERROR: {e}"
+
+    today_dt    = datetime.now().date()
+    tomorrow_dt = today_dt + timedelta(days=1)
+    due_today    = []
+    due_tomorrow = []
+
+    for acct_id in BASECAMP_ACCOUNT_IDS:
+        try:
+            raw = bc_get(token, acct_id, "my/assignments.json")
+            todos = []
+            for item in raw:
+                if isinstance(item, dict) and "priorities" in item:
+                    todos.extend(item.get("priorities", []))
+                    todos.extend(item.get("non_priorities", []))
+                elif isinstance(item, dict) and item.get("title"):
+                    todos.append(item)
+            for t in todos:
+                if t.get("completed"):
+                    continue
+                proj_raw = (t.get("bucket") or {}).get("name", "")
+                brand    = TARGET_PROJECTS.get(proj_raw.lower().strip(), "")
+                if not brand:
+                    continue  # sadece hedef projeler
+                due_on = t.get("due_on")  # "2025-12-31" veya None
+                if not due_on:
+                    continue
+                try:
+                    due_date = datetime.strptime(due_on, "%Y-%m-%d").date()
+                except Exception:
+                    continue
+                tid = t.get("id")
+                bid = (t.get("bucket") or {}).get("id")
+                url = (f"https://3.basecamp.com/{acct_id}/buckets/{bid}/todos/{tid}"
+                       if tid and bid else "")
+                entry = {"name": get_todo_title(t), "brand": brand,
+                         "due_on": due_on, "url": url}
+                if due_date == today_dt:
+                    due_today.append(entry)
+                    print(f"  🔴 [BUGÜN] {entry['name']}")
+                elif due_date == tomorrow_dt:
+                    due_tomorrow.append(entry)
+                    print(f"  🟡 [YARIN] {entry['name']}")
+        except Exception as e:
+            print(f"⚠️  Deadline {acct_id}: {e}")
+
+    total = len(due_today) + len(due_tomorrow)
+    if total == 0:
+        print("✅ Yaklaşan deadline yok")
+        return "OK: deadline yok"
+
+    fetched_at = datetime.now().strftime("%d.%m.%Y %H:%M")
+    html = build_deadline_html(due_today, due_tomorrow, fetched_at)
+    subject = (f"⏰ Deadline Uyarısı — {fetched_at} "
+               f"({len(due_today)} bugün, {len(due_tomorrow)} yarın)")
+    if BREVO_API_KEY:
+        try:
+            send_email(subject, f"Deadline: {len(due_today)} bugün, {len(due_tomorrow)} yarın", html)
+            print("✉️  Deadline maili gönderildi")
+        except Exception as e:
+            print(f"⚠️  Deadline mail: {e}")
+    return f"OK: {len(due_today)} bugün, {len(due_tomorrow)} yarın"
+
+
+# ══════════════════════════════════════════════════════════════════════════
 #  DEBOUNCE
 # ══════════════════════════════════════════════════════════════════════════
 
@@ -1145,10 +1387,12 @@ def dashboard():
             days  = get_days_in_category(first_seen, category, it["name"])
             badge = _dur_badge_html(days)
             bc_link = _bc_url(it)
+            safe_name = it['name'].replace("'", "&#39;")
             name_html = (f"<a href='{bc_link}' target='_blank' style='color:#333;"
                          f"text-decoration:none;font-weight:bold;'>{it['name']} ↗</a>"
                          if bc_link else f"<b>{it['name']}</b>")
-            rows += (f"<li style='padding:4px 0;border-bottom:1px solid #f5f5f5;'>{name_html} "
+            rows += (f"<li class='search-item' data-name='{safe_name}' "
+                     f"style='padding:4px 0;border-bottom:1px solid #f5f5f5;'>{name_html} "
                      f"<span style='color:#aaa;font-size:11px;'>— {it.get('brand','')}</span>{badge}</li>")
         return (f"<div style='flex:1;min-width:220px;background:#fff;border-radius:8px;"
                 f"box-shadow:0 1px 4px rgba(0,0,0,.08);overflow:hidden;border-left:4px solid {color};'>"
@@ -1221,10 +1465,19 @@ def dashboard():
   <meta http-equiv="refresh" content="300">
   <title>BC Takip · Dashboard</title>
   <style>
-    body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,sans-serif;background:#f0f2f5;margin:0;padding:20px;}}
+    body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,sans-serif;background:#f0f2f5;margin:0;padding:20px;transition:background .2s,color .2s;}}
     .wrap{{max-width:860px;margin:0 auto;}}
     a{{color:#1976d2;text-decoration:none;}} a:hover{{text-decoration:underline;}}
     details>summary::-webkit-details-marker{{display:none;}}
+    /* ── Dark mode ── */
+    body.dark{{filter:invert(100%) hue-rotate(180deg);}}
+    body.dark img, body.dark [style*="background:linear-gradient"]{{filter:invert(100%) hue-rotate(180deg);}}
+    /* ── Arama ── */
+    #search-bar{{width:100%;box-sizing:border-box;padding:9px 14px;border:1px solid #ddd;border-radius:8px;
+      font-size:14px;margin-bottom:14px;background:#fff;outline:none;}}
+    #search-bar:focus{{border-color:#1976d2;box-shadow:0 0 0 3px rgba(25,118,210,.15);}}
+    .search-item{{transition:opacity .15s;}}
+    .search-item.hidden{{display:none;}}
   </style>
 </head>
 <body><div class="wrap">
@@ -1243,9 +1496,40 @@ def dashboard():
         <a href='/run' style='background:#00b050;color:#fff;padding:8px 16px;border-radius:6px;font-size:13px;font-weight:bold;text-decoration:none;'>▶ Rapor Çalıştır</a>
         <a href='/status' style='background:rgba(255,255,255,.15);color:#fff;padding:8px 16px;border-radius:6px;font-size:13px;text-decoration:none;'>📡 BC Durumu</a>
         <a href='/history' style='background:rgba(255,255,255,.15);color:#fff;padding:8px 16px;border-radius:6px;font-size:13px;text-decoration:none;'>📅 Geçmiş</a>
+        <a href='/export.csv' style='background:rgba(255,255,255,.15);color:#fff;padding:8px 16px;border-radius:6px;font-size:13px;text-decoration:none;'>⬇️ CSV</a>
+        <button onclick="toggleDark()" id="darkBtn"
+          style='background:rgba(255,255,255,.15);color:#fff;padding:8px 16px;border-radius:6px;font-size:13px;border:none;cursor:pointer;'>🌙 Dark</button>
       </div>
     </div>
   </div>
+
+  <input id="search-bar" type="text" placeholder="🔍 İş ara... (anlık filtre)" oninput="doSearch(this.value)">
+
+  <script>
+  // Dark mode
+  (function(){{
+    if(localStorage.getItem('bc_dark')==='1'){{
+      document.body.classList.add('dark');
+      var b=document.getElementById('darkBtn');
+      if(b)b.textContent='☀️ Light';
+    }}
+  }})();
+  function toggleDark(){{
+    var on=document.body.classList.toggle('dark');
+    localStorage.setItem('bc_dark',on?'1':'0');
+    var b=document.getElementById('darkBtn');
+    if(b)b.textContent=on?'☀️ Light':'🌙 Dark';
+  }}
+  // Search
+  function doSearch(q){{
+    q=q.trim().toLowerCase();
+    document.querySelectorAll('.search-item').forEach(function(el){{
+      if(!q){{el.classList.remove('hidden');return;}}
+      var name=(el.dataset.name||'').toLowerCase();
+      el.classList.toggle('hidden',!name.includes(q));
+    }});
+  }}
+  </script>
 
   {error_block}
 
@@ -1292,7 +1576,8 @@ def dashboard():
   <div style='text-align:center;font-size:11px;color:#aaa;margin-top:4px;'>
     bc-takip-production.up.railway.app ·
     <a href='/run'>Manuel</a> · <a href='/status'>BC Durumu</a> ·
-    <a href='/history'>Geçmiş</a> · <a href='/health'>Health</a> · <a href='/debug-excel'>Excel Debug</a>
+    <a href='/history'>Geçmiş</a> · <a href='/deadlines'>Deadline</a> ·
+    <a href='/export.csv'>CSV</a> · <a href='/health'>Health</a> · <a href='/debug-excel'>Excel Debug</a>
   </div>
 </div></body></html>""", 200
 
@@ -1524,6 +1809,43 @@ def debug():
     return f"<pre>{chr(10).join(lines)}</pre>", 200
 
 
+@app.route("/export.csv")
+def export_csv():
+    """Mevcut state'i CSV olarak indir."""
+    import csv
+    import io as _io
+    state = load_state()
+    if not state:
+        from flask import Response
+        return Response("Henüz rapor çalışmadı.", mimetype="text/plain"), 404
+
+    fs  = state.get("first_seen", {})
+    buf = _io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["Kategori", "İş Adı", "Marka", "Basecamp URL", "İlk Görülme"])
+    for cat, label in [("sil","SİL"), ("yesile","YEŞİLE"), ("renksiz","RENKSİZ"),
+                       ("ekle","EKLE"), ("url_eksik","URL_EKSİK")]:
+        for item in _as_items(state.get(cat, [])):
+            url   = _bc_url(item)
+            first = fs.get(f"{cat}:{item['name']}", "")
+            writer.writerow([label, item["name"], item.get("brand",""), url, first])
+
+    filename = "bc-takip-" + datetime.now().strftime("%Y%m%d") + ".csv"
+    from flask import Response
+    return Response(
+        "\ufeff" + buf.getvalue(),   # BOM → Excel Türkçe karakter desteği
+        mimetype="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f"attachment; filename={filename}"},
+    )
+
+
+@app.route("/deadlines")
+def manual_deadlines():
+    """Deadline kontrolünü manuel tetikler."""
+    result = run_deadline_check(trigger="manual")
+    return f"<pre>{result}</pre>", 200
+
+
 @app.route("/debug-excel")
 def debug_excel():
     try:
@@ -1589,12 +1911,32 @@ def setup_webhooks():
 
 def start_scheduler():
     scheduler = BackgroundScheduler(timezone="Europe/Istanbul")
-    scheduler.add_job(run_report, CronTrigger(day_of_week="mon-fri", hour=18, minute=0, timezone="Europe/Istanbul"),
-                      kwargs={"trigger": "cron"}, id="daily_report", replace_existing=True)
-    scheduler.add_job(run_weekly_summary, CronTrigger(day_of_week="fri", hour=18, minute=5, timezone="Europe/Istanbul"),
-                      id="weekly_summary", replace_existing=True)
+    scheduler.add_job(
+        run_report,
+        CronTrigger(day_of_week="mon-fri", hour=18, minute=0, timezone="Europe/Istanbul"),
+        kwargs={"trigger": "cron"}, id="daily_report", replace_existing=True,
+    )
+    scheduler.add_job(
+        run_weekly_summary,
+        CronTrigger(day_of_week="fri", hour=18, minute=5, timezone="Europe/Istanbul"),
+        id="weekly_summary", replace_existing=True,
+    )
+    scheduler.add_job(
+        run_morning_digest,
+        CronTrigger(day_of_week="mon-fri", hour=9, minute=0, timezone="Europe/Istanbul"),
+        id="morning_digest", replace_existing=True,
+    )
+    scheduler.add_job(
+        run_deadline_check,
+        CronTrigger(day_of_week="mon-fri", hour=9, minute=1, timezone="Europe/Istanbul"),
+        kwargs={"trigger": "cron"}, id="deadline_check", replace_existing=True,
+    )
     scheduler.start()
-    print("📅 Scheduler: Haftaiçi 18:00 + Cuma 18:05 haftalık özet")
+    print("📅 Scheduler:")
+    print("   Haftaiçi 09:00 → Sabah digest (state özeti)")
+    print("   Haftaiçi 09:01 → Deadline kontrolü (BC API)")
+    print("   Haftaiçi 18:00 → Günlük rapor")
+    print("   Cuma     18:05 → Haftalık özet")
     print(f"📁 State: {STATE_FILE}")
     print(f"🔒 Webhook: {'AKTIF' if WEBHOOK_SECRET else 'WEBHOOK_SECRET ayarlanmamış'}")
 
