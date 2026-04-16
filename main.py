@@ -657,9 +657,10 @@ def manual_run():
 WEBHOOK_TRIGGER_KINDS = {
     "todo_completed",          # tamamlandı
     "todo_uncompleted",        # tamamlanmadı olarak geri alındı
-    "todo_created",            # yeni iş oluşturuldu (liste değişimi de bunu tetikler)
+    "todo_created",            # yeni iş oluşturuldu
     "todo_assignment_changed", # atanan kişi değişti
     "todo_trashed",            # silindi / arşivlendi
+    "todo_moved",              # liste değişti (Tasarımda → Marka Onayında gibi)
 }
 
 @app.route("/webhook", methods=["POST"])
