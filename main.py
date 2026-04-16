@@ -229,10 +229,19 @@ def _parse_excel_bytes(content: bytes) -> list[dict]:
 
 
 def read_excel_tasks() -> list[dict]:
-    sep = "&" if "?" in EXCEL_URL else "?"
-    download_url = EXCEL_URL + sep + "download=1"
+    import time as _time
+    sep          = "&" if "?" in EXCEL_URL else "?"
+    cache_bust   = int(_time.time())                          # CDN cache'i kır
+    download_url = EXCEL_URL + sep + f"download=1&_t={cache_bust}"
+
+    no_cache_headers = {
+        "User-Agent":     "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        "Cache-Control":  "no-cache, no-store, must-revalidate",
+        "Pragma":         "no-cache",
+        "Expires":        "0",
+    }
     session = req_lib.Session()
-    session.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+    session.headers.update(no_cache_headers)
     session.get(EXCEL_URL, timeout=30, allow_redirects=True)
     r = session.get(download_url, timeout=30, allow_redirects=True)
     content = r.content
