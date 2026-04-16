@@ -52,9 +52,10 @@ RECIPIENT_EMAIL = os.environ.get("RECIPIENT_EMAIL", "ertugozerr@gmail.com")
 STATE_DIR        = os.environ.get("STATE_DIR", "/tmp")
 STATE_FILE       = os.path.join(STATE_DIR, "bc_state.json")
 WEBHOOK_LOG_FILE = os.path.join(STATE_DIR, "bc_webhook_log.json")
-NOTES_FILE       = os.path.join(STATE_DIR, "bc_notes.json")
-SPRINTS_FILE     = os.path.join(STATE_DIR, "bc_sprints.json")
-CHANGELOG_FILE   = os.path.join(STATE_DIR, "bc_changelog.md")
+NOTES_FILE         = os.path.join(STATE_DIR, "bc_notes.json")
+SPRINTS_FILE       = os.path.join(STATE_DIR, "bc_sprints.json")
+CHANGELOG_FILE     = os.path.join(STATE_DIR, "bc_changelog.md")
+HEALTH_STATUS_FILE = os.path.join(STATE_DIR, "bc_health.json")
 
 # ─── Webhook güvenliği ─────────────────────────────────────────────────────
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
@@ -603,6 +604,254 @@ def append_changelog(changes: list, today: str, trigger: str):
             f.writelines(lines)
     except Exception as e:
         print(f"⚠️  Changelog: {e}")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  OTOMATİK SİSTEM SAĞLIK KONTROLÜ
+# ══════════════════════════════════════════════════════════════════════════
+
+def load_health_status() -> dict:
+    try:
+        with open(HEALTH_STATUS_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {"bc_api": "unknown", "excel": "unknown", "last_check": ""}
+
+
+def save_health_status(bc_ok: bool, excel_ok: bool):
+    try:
+        with open(HEALTH_STATUS_FILE, "w", encoding="utf-8") as f:
+            json.dump({
+                "bc_api":     "ok" if bc_ok else "fail",
+                "excel":      "ok" if excel_ok else "fail",
+                "last_check": datetime.now().strftime("%d.%m.%Y %H:%M"),
+            }, f, ensure_ascii=False)
+    except Exception as e:
+        print(f"⚠️  Health status kayıt: {e}")
+
+
+def _check_bc_api() -> bool:
+    try:
+        get_access_token()
+        return True
+    except Exception:
+        return False
+
+
+def _check_excel_url() -> bool:
+    try:
+        r = req_lib.get(EXCEL_URL, timeout=15, stream=True)
+        r.close()
+        return r.status_code < 400
+    except Exception:
+        return False
+
+
+def _build_health_alert_html(issues: list, resolved: list, now_str: str) -> str:
+    issue_rows = "".join(
+        f"<li style='padding:4px 0;'>"
+        f"<span style='color:#c62828;font-weight:bold;'>🔴 {issue}</span></li>"
+        for issue in issues
+    )
+    resolved_rows = "".join(
+        f"<li style='padding:4px 0;'>"
+        f"<span style='color:#00b050;font-weight:bold;'>🟢 {r} — normale döndü</span></li>"
+        for r in resolved
+    )
+    header_bg  = "#c62828" if issues else "#00b050"
+    header_txt = "⚠️ Sistem Sorunu Tespit Edildi" if issues else "✅ Sistem Normale Döndü"
+    body_html  = (
+        (f"<ul style='margin:0;padding-left:20px;'>{issue_rows}</ul>" if issues else "") +
+        (f"<ul style='margin:0;padding-left:20px;margin-top:8px;'>{resolved_rows}</ul>"
+         if resolved else "")
+    )
+    return f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"></head>
+<body style='font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,sans-serif;background:#f5f5f5;margin:0;padding:20px;'>
+  <div style='max-width:520px;margin:0 auto;'>
+    <div style='background:{header_bg};color:#fff;border-radius:10px;padding:18px 22px;margin-bottom:14px;'>
+      <div style='font-size:11px;opacity:.7;text-transform:uppercase;letter-spacing:1px;margin-bottom:4px;'>PunchBBDO — BC Takip</div>
+      <div style='font-size:20px;font-weight:bold;'>{header_txt}</div>
+      <div style='font-size:12px;opacity:.8;margin-top:4px;'>{now_str}</div>
+    </div>
+    <div style='background:#fff;border-radius:8px;padding:16px;box-shadow:0 1px 4px rgba(0,0,0,.08);'>
+      {body_html}
+    </div>
+    <div style='text-align:center;font-size:11px;color:#aaa;margin-top:12px;'>bc-takip-production.up.railway.app</div>
+  </div>
+</body></html>"""
+
+
+def run_health_check(trigger: str = "cron"):
+    """BC API + Excel URL erişimini kontrol eder; durum değişirse mail atar."""
+    now_str  = datetime.now().strftime("%d.%m.%Y %H:%M")
+    prev     = load_health_status()
+    bc_ok    = _check_bc_api()
+    excel_ok = _check_excel_url()
+
+    prev_bc    = prev.get("bc_api",  "unknown")
+    prev_excel = prev.get("excel",   "unknown")
+
+    issues   = []
+    resolved = []
+
+    # BC API
+    if not bc_ok:
+        issues.append("Basecamp API erişilemiyor — token süresi dolmuş olabilir")
+    elif prev_bc == "fail":
+        resolved.append("Basecamp API")
+
+    # Excel
+    if not excel_ok:
+        issues.append("Excel URL erişilemiyor — link değişmiş veya dosya kaldırılmış olabilir")
+    elif prev_excel == "fail":
+        resolved.append("Excel URL")
+
+    save_health_status(bc_ok, excel_ok)
+
+    bc_sym    = "✅" if bc_ok    else "❌"
+    excel_sym = "✅" if excel_ok else "❌"
+    print(f"🩺 Sağlık [{trigger}]: BC {bc_sym}  Excel {excel_sym}")
+
+    # Sadece durum değişiminde mail at (önceki OK→FAIL veya FAIL→OK)
+    should_mail = bool(issues or resolved)
+    # Eğer önceki durum da fail ise tekrar mail atma (spam önleme)
+    if issues and prev_bc == "fail" and prev_excel == "fail":
+        should_mail = False
+    if issues and not bc_ok and prev_bc == "fail" and excel_ok:
+        should_mail = True   # excel yeni düzeldi bile olsa BC hâlâ fail → zaten issue var
+
+    if should_mail and BREVO_API_KEY:
+        subject = (f"⚠️ BC Takip Sistem Sorunu — {now_str}"
+                   if issues else f"✅ BC Takip Normale Döndü — {now_str}")
+        html = _build_health_alert_html(issues, resolved, now_str)
+        try:
+            send_email(subject, subject, html)
+            print("✉️  Sağlık uyarısı gönderildi")
+        except Exception as e:
+            print(f"⚠️  Sağlık maili: {e}")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  AYLIK ÖZET
+# ══════════════════════════════════════════════════════════════════════════
+
+def is_last_weekday_of_month() -> bool:
+    """Bugün ayın son haftaiçi günü mü?"""
+    today = datetime.now().date()
+    if today.weekday() >= 5:          # Cumartesi/Pazar
+        return False
+    # Ayın son gününü bul
+    if today.month == 12:
+        last_day = today.replace(day=31)
+    else:
+        last_day = today.replace(month=today.month + 1, day=1) - timedelta(days=1)
+    # Son günden geriye doğru ilk haftaiçi günü bul
+    while last_day.weekday() >= 5:
+        last_day -= timedelta(days=1)
+    return today == last_day
+
+
+def build_monthly_html(history: list, year_month: str) -> str:
+    """year_month = 'YYYY-MM' formatında. O aya ait history özetini HTML olarak döndürür."""
+    try:
+        dt_label = datetime.strptime(year_month + "-01", "%Y-%m-%d").strftime("%B %Y")
+    except Exception:
+        dt_label = year_month
+
+    entries = [h for h in history if h.get("date", "").startswith(year_month)]
+
+    total_completed = len({n for h in entries for n in h.get("completed", [])})
+    total_new_onay  = len({n for h in entries for n in h.get("new_onay", [])})
+    total_ekle      = sum(h.get("ekle_count", 0) for h in entries)
+    total_yesile    = sum(h.get("yesile_count", 0) for h in entries)
+    report_count    = len(entries)
+
+    # En aktif günler (en fazla tamamlanan)
+    busiest = sorted(entries, key=lambda x: len(x.get("completed", [])), reverse=True)[:3]
+    busiest_rows = "".join(
+        f"<li style='padding:3px 0;font-size:13px;'><b>{h.get('date','')}</b> — "
+        f"{len(h.get('completed',[]))} tamamlandı, "
+        f"{len(h.get('new_onay',[]))} yeni onay</li>"
+        for h in busiest if h.get("completed") or h.get("new_onay")
+    ) or "<li style='color:#888;font-style:italic;'>Veri yok</li>"
+
+    # Tamamlanan işlerin tam listesi
+    completed_names = sorted({n for h in entries for n in h.get("completed", [])})
+    comp_html = ("".join(f"<li style='padding:2px 0;font-size:13px;'>{n}</li>"
+                         for n in completed_names)
+                 or "<li style='color:#888;font-style:italic;'>Yok</li>")
+
+    new_onay_names = sorted({n for h in entries for n in h.get("new_onay", [])})
+    onay_html = ("".join(f"<li style='padding:2px 0;font-size:13px;'>{n}</li>"
+                         for n in new_onay_names)
+                 or "<li style='color:#888;font-style:italic;'>Yok</li>")
+
+    if not entries:
+        body = "<p style='color:#888;text-align:center;padding:24px;'>Bu ay için rapor verisi bulunamadı.</p>"
+    else:
+        body = f"""
+    <div style='display:flex;gap:10px;margin-bottom:16px;flex-wrap:wrap;'>
+      <div style='flex:1;min-width:100px;background:#fff;border-radius:8px;padding:14px;box-shadow:0 1px 4px rgba(0,0,0,.08);text-align:center;border-top:3px solid #00b050;'>
+        <div style='font-size:30px;font-weight:bold;color:#00b050;'>{total_completed}</div>
+        <div style='font-size:11px;color:#888;margin-top:4px;'>Tamamlanan İş</div></div>
+      <div style='flex:1;min-width:100px;background:#fff;border-radius:8px;padding:14px;box-shadow:0 1px 4px rgba(0,0,0,.08);text-align:center;border-top:3px solid #1976d2;'>
+        <div style='font-size:30px;font-weight:bold;color:#1976d2;'>{total_new_onay}</div>
+        <div style='font-size:11px;color:#888;margin-top:4px;'>Marka Onayına Geldi</div></div>
+      <div style='flex:1;min-width:100px;background:#fff;border-radius:8px;padding:14px;box-shadow:0 1px 4px rgba(0,0,0,.08);text-align:center;border-top:3px solid #9c27b0;'>
+        <div style='font-size:30px;font-weight:bold;color:#9c27b0;'>{total_ekle}</div>
+        <div style='font-size:11px;color:#888;margin-top:4px;'>Excel'e Eklendi</div></div>
+      <div style='flex:1;min-width:100px;background:#fff;border-radius:8px;padding:14px;box-shadow:0 1px 4px rgba(0,0,0,.08);text-align:center;border-top:3px solid #607d8b;'>
+        <div style='font-size:30px;font-weight:bold;color:#607d8b;'>{report_count}</div>
+        <div style='font-size:11px;color:#888;margin-top:4px;'>Rapor Çalıştı</div></div>
+    </div>
+    <div style='background:#fff;border-radius:8px;padding:14px 16px;box-shadow:0 1px 4px rgba(0,0,0,.08);margin-bottom:12px;border-left:4px solid #f57c00;'>
+      <div style='font-weight:bold;color:#f57c00;margin-bottom:6px;'>🏆 En Aktif Günler</div>
+      <ul style='margin:0;padding-left:20px;'>{busiest_rows}</ul>
+    </div>
+    <div style='display:flex;gap:10px;flex-wrap:wrap;'>
+      <div style='flex:1;min-width:200px;background:#fff;border-radius:8px;padding:14px;box-shadow:0 1px 4px rgba(0,0,0,.08);border-left:4px solid #00b050;'>
+        <div style='font-weight:bold;color:#00b050;margin-bottom:6px;'>✅ Tamamlanan İşler</div>
+        <ul style='margin:0;padding-left:18px;'>{comp_html}</ul></div>
+      <div style='flex:1;min-width:200px;background:#fff;border-radius:8px;padding:14px;box-shadow:0 1px 4px rgba(0,0,0,.08);border-left:4px solid #1976d2;'>
+        <div style='font-weight:bold;color:#1976d2;margin-bottom:6px;'>🔵 Marka Onayına Gelenler</div>
+        <ul style='margin:0;padding-left:18px;'>{onay_html}</ul></div>
+    </div>"""
+
+    return f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"></head>
+<body style='font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,sans-serif;background:#f5f5f5;margin:0;padding:20px;'>
+  <div style='max-width:620px;margin:0 auto;'>
+    <div style='background:linear-gradient(135deg,#1a1a2e,#16213e);color:#fff;border-radius:10px;padding:20px 24px;margin-bottom:16px;'>
+      <div style='font-size:11px;text-transform:uppercase;letter-spacing:1px;opacity:.7;margin-bottom:4px;'>PunchBBDO — Excel Takip</div>
+      <div style='font-size:22px;font-weight:bold;'>📆 Aylık Özet</div>
+      <div style='font-size:13px;opacity:.8;margin-top:4px;'>{dt_label}</div>
+    </div>
+    {body}
+    <div style='text-align:center;font-size:11px;color:#aaa;margin-top:20px;'>Aylık özet · bc-takip-production.up.railway.app</div>
+  </div>
+</body></html>"""
+
+
+def run_monthly_summary():
+    """Ayın son haftaiçi günü 18:10'da çalışır. Aylık mail özetini gönderir."""
+    if not is_last_weekday_of_month():
+        return   # Bugün son haftaiçi değilse sessizce çık
+    print("\n📆 Aylık özet başlatıldı")
+    state   = load_state()
+    history = state.get("history", []) if state else []
+    # History sadece 14 gün tutuyor — aylık için changelog'a bakmak gerekebilir.
+    # Mevcut history içinden bu ayın verilerini çek.
+    year_month = datetime.now().strftime("%Y-%m")
+    today_str  = datetime.now().strftime("%d.%m.%Y")
+    html = build_monthly_html(history, year_month)
+    if BREVO_API_KEY:
+        try:
+            dt_label = datetime.now().strftime("%B %Y")
+            send_email(f"📆 Aylık Özet — {dt_label}", f"Aylık özet: {today_str}", html)
+            print("✉️  Aylık özet gönderildi")
+        except Exception as e:
+            print(f"⚠️  Aylık özet: {e}")
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -1492,13 +1741,20 @@ def schedule_debounced_report(kind: str):
 
 @app.route("/health")
 def health():
-    state = load_state()
+    state  = load_state()
+    health_st = load_health_status()
     return jsonify({
-        "status": "ok", "time": datetime.now().isoformat(),
-        "last_report": state.get("timestamp", "—"),
-        "last_error": state.get("last_error"),
-        "state_dir": STATE_DIR,
-        "webhook_secret": "set" if WEBHOOK_SECRET else "not_set",
+        "status":          "ok",
+        "time":            datetime.now().isoformat(),
+        "last_report":     state.get("timestamp", "—"),
+        "last_error":      state.get("last_error"),
+        "state_dir":       STATE_DIR,
+        "webhook_secret":  "set" if WEBHOOK_SECRET else "not_set",
+        "health_check": {
+            "bc_api":     health_st.get("bc_api",    "unknown"),
+            "excel":      health_st.get("excel",     "unknown"),
+            "last_check": health_st.get("last_check","—"),
+        },
     })
 
 
@@ -1870,6 +2126,12 @@ def dashboard():
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <meta http-equiv="refresh" content="300">
+  <meta name="theme-color" content="#1a1a2e">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="BC Takip">
+  <link rel="manifest" href="/manifest.json">
   <title>BC Takip · Dashboard</title>
   <style>
     body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,sans-serif;background:#f0f2f5;margin:0;padding:20px;transition:background .2s,color .2s;}}
@@ -1936,6 +2198,10 @@ def dashboard():
       var name=(el.dataset.name||'').toLowerCase();
       el.classList.toggle('hidden',!name.includes(q));
     }});
+  }}
+  // PWA Service Worker
+  if('serviceWorker' in navigator){{
+    navigator.serviceWorker.register('/sw.js').catch(function(){{}});
   }}
   </script>
 
@@ -2467,6 +2733,91 @@ def manual_deadlines():
     return f"<pre>{result}</pre>", 200
 
 
+# ── PWA ────────────────────────────────────────────────────────────────────
+
+# Basit SVG ikon — BC harfli koyu lacivert kare (data URI olarak manifest'e gömülü)
+_PWA_ICON_SVG = (
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 192 192">'
+    '<rect width="192" height="192" rx="32" fill="#1a1a2e"/>'
+    '<text x="96" y="128" font-family="Arial,sans-serif" font-size="88" '
+    'font-weight="bold" fill="#ffffff" text-anchor="middle">BC</text>'
+    '</svg>'
+)
+
+
+@app.route("/manifest.json")
+def pwa_manifest():
+    import base64
+    icon_b64 = base64.b64encode(_PWA_ICON_SVG.encode()).decode()
+    icon_uri  = "data:image/svg+xml;base64," + icon_b64
+    manifest = {
+        "name":             "BC Takip",
+        "short_name":       "BC Takip",
+        "description":      "PunchBBDO — Basecamp & Excel PM Takip Sistemi",
+        "start_url":        "/dashboard",
+        "display":          "standalone",
+        "background_color": "#f0f2f5",
+        "theme_color":      "#1a1a2e",
+        "orientation":      "portrait-primary",
+        "icons": [
+            {"src": icon_uri, "sizes": "192x192", "type": "image/svg+xml", "purpose": "any maskable"},
+            {"src": icon_uri, "sizes": "512x512", "type": "image/svg+xml", "purpose": "any maskable"},
+        ],
+        "shortcuts": [
+            {"name": "Rapor Çalıştır", "url": "/run",      "description": "Manuel rapor"},
+            {"name": "BC Durumu",      "url": "/status",   "description": "Canlı Basecamp görünümü"},
+            {"name": "Geçmiş",         "url": "/history",  "description": "Son 14 gün"},
+        ],
+    }
+    from flask import Response
+    return Response(
+        json.dumps(manifest, ensure_ascii=False, indent=2),
+        mimetype="application/manifest+json",
+    )
+
+
+@app.route("/sw.js")
+def service_worker():
+    """Minimal service worker: çevrimdışıyken son dashboard cache'ini gösterir."""
+    sw_code = """
+const CACHE = 'bc-takip-v1';
+const OFFLINE_URL = '/dashboard';
+
+self.addEventListener('install', e => {
+  e.waitUntil(
+    caches.open(CACHE).then(c => c.add(OFFLINE_URL))
+  );
+  self.skipWaiting();
+});
+
+self.addEventListener('activate', e => {
+  e.waitUntil(
+    caches.keys().then(keys =>
+      Promise.all(keys.filter(k => k !== CACHE).map(k => caches.delete(k)))
+    )
+  );
+  self.clients.claim();
+});
+
+self.addEventListener('fetch', e => {
+  if (e.request.method !== 'GET') return;
+  e.respondWith(
+    fetch(e.request)
+      .then(res => {
+        if (res.ok) {
+          const clone = res.clone();
+          caches.open(CACHE).then(c => c.put(e.request, clone));
+        }
+        return res;
+      })
+      .catch(() => caches.match(e.request).then(r => r || caches.match(OFFLINE_URL)))
+  );
+});
+"""
+    from flask import Response
+    return Response(sw_code, mimetype="application/javascript")
+
+
 @app.route("/debug-excel")
 def debug_excel():
     try:
@@ -2542,6 +2893,13 @@ def start_scheduler():
         CronTrigger(day_of_week="fri", hour=18, minute=5, timezone="Europe/Istanbul"),
         id="weekly_summary", replace_existing=True,
     )
+    # Aylık özet — her haftaiçi 18:10'da çalışır,
+    # ama yalnızca ayın son haftaiçi günüyse mail atar.
+    scheduler.add_job(
+        run_monthly_summary,
+        CronTrigger(day_of_week="mon-fri", hour=18, minute=10, timezone="Europe/Istanbul"),
+        id="monthly_summary", replace_existing=True,
+    )
     scheduler.add_job(
         run_morning_digest,
         CronTrigger(day_of_week="mon-fri", hour=9, minute=0, timezone="Europe/Istanbul"),
@@ -2552,12 +2910,26 @@ def start_scheduler():
         CronTrigger(day_of_week="mon-fri", hour=9, minute=1, timezone="Europe/Istanbul"),
         kwargs={"trigger": "cron"}, id="deadline_check", replace_existing=True,
     )
+    # Sistem sağlık kontrolü — sabah 08:30 ve öğleden sonra 14:30
+    scheduler.add_job(
+        run_health_check,
+        CronTrigger(day_of_week="mon-fri", hour=8, minute=30, timezone="Europe/Istanbul"),
+        kwargs={"trigger": "cron-morning"}, id="health_morning", replace_existing=True,
+    )
+    scheduler.add_job(
+        run_health_check,
+        CronTrigger(day_of_week="mon-fri", hour=14, minute=30, timezone="Europe/Istanbul"),
+        kwargs={"trigger": "cron-afternoon"}, id="health_afternoon", replace_existing=True,
+    )
     scheduler.start()
     print("📅 Scheduler:")
-    print("   Haftaiçi 09:00 → Sabah digest (state özeti)")
-    print("   Haftaiçi 09:01 → Deadline kontrolü (BC API)")
+    print("   Haftaiçi 08:30 → Sistem sağlık kontrolü")
+    print("   Haftaiçi 09:00 → Sabah digest")
+    print("   Haftaiçi 09:01 → Deadline kontrolü")
+    print("   Haftaiçi 14:30 → Sistem sağlık kontrolü")
     print("   Haftaiçi 18:00 → Günlük rapor")
     print("   Cuma     18:05 → Haftalık özet")
+    print("   Ayın son haftaiçi 18:10 → Aylık özet")
     print(f"📁 State: {STATE_FILE}")
     print(f"🔒 Webhook: {'AKTIF' if WEBHOOK_SECRET else 'WEBHOOK_SECRET ayarlanmamış'}")
 
